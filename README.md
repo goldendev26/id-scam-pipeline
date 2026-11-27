@@ -2,7 +2,7 @@
 
 Passive discovery, sandboxed verification, deduplication, and human-in-the-loop triage pipeline for **Hackathon Berantas Web Ilegal di Indo** (IMPHNEN, 5-10 Dec 2026 WIB).
 
-Built for a 3-person team (**Jasson, Zhafran, Ammar**) to report live Indonesian illegal websites (online gambling, unlicensed loans, phishing, and digital scams) safely, legally, and at high precision.
+Built to report live Indonesian illegal websites (online gambling, unlicensed loans, phishing, and digital scams) safely, legally, and at high precision.
 
 ## Architecture
 
@@ -38,27 +38,18 @@ Built for a 3-person team (**Jasson, Zhafran, Ammar**) to report live Indonesian
 
 ```text
 id-scam-pipeline/
-├── docs/
-│   ├── functional-guide.md      # End-to-end workflow, URL lifecycle, and design decisions
-│   └── technical-deep-dive.md   # Implementation notes, edge cases, and team study guide
-├── src/
-│   ├── __init__.py
-│   └── normalizer.py            # Exact imphnen.dev URL normalizer and batch parser (FR-NORM-001)
-├── tests/
-│   ├── __init__.py
-│   └── test_normalizer.py       # Unit tests covering official examples and edge cases
-├── .env.example                 # Environment variable template
+├── src/            # Pipeline modules (normalizer, discovery, verifier, AI triage, dashboard)
+├── tests/          # Unit and integration tests
+├── .env.example    # Environment variable template
 ├── requirements.txt
 └── LICENSE
 ```
-
-*(Upcoming phases will add `sql/schema.sql`, `src/db.py`, `src/verify.py`, `Dockerfile`, `src/discover.py`, `src/ai_triage.py`, and `src/app.py`.)*
 
 ## Quickstart
 
 ```bash
 # 1. Clone and enter the repository
-git clone git@github.com:sen-17/id-scam-pipeline.git
+git clone https://github.com/goldendev26/id-scam-pipeline.git
 cd id-scam-pipeline
 
 # 2. Create a local environment file
