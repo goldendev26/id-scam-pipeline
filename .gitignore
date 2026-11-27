@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+docs
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
@@ -221,3 +222,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# id-scam-pipeline local data & artifacts
+.env.local
+data/
+screenshots/
+*.db
+*.sqlite
+.DS_Store
+

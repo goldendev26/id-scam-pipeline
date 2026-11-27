@@ -1,0 +1,25 @@
+# Core & Config
+python-dotenv>=1.0.1
+httpx>=0.27.2
+beautifulsoup4>=4.12.3
+
+# Discovery (Passive)
+websockets>=13.1
+dnspython>=2.7.0
+
+# Database & Storage (Supabase)
+supabase>=2.9.0
+
+# AI Triage (DeepSeek via OpenAI-compatible SDK)
+openai>=1.54.0
+
+# Team Dashboard UI (FastAPI)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+jinja2>=3.1.4
+
+# Sandbox Verifier (installed inside Docker image as well)
+playwright>=1.48.0
+
+# Testing
+pytest>=8.3.3
