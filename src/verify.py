@@ -417,6 +417,29 @@ class SafeBrowserVerifier:
 
                 title = (await page.title()).strip() or None
                 raw_html = await page.content()
+
+                clean_text = extract_clean_text(raw_html)
+                assessment = assess_page(
+                    final_url=final_url,
+                    http_status=http_status,
+                    title=title,
+                    text=clean_text,
+                )
+                if assessment.is_dead_or_blocked:
+                    return VerifyResult(
+                        input_url=raw_url,
+                        normalized_url=norm.normalized,
+                        final_url=final_url,
+                        final_normalized_url=final_norm.normalized,
+                        status=STATUS_DEAD_OR_BLOCKED,
+                        http_status=http_status,
+                        page_title=title,
+                        raw_html=raw_html,
+                        error_code=assessment.error_code,
+                        error_detail=assessment.detail,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                    )
+
                 screenshot: Optional[bytes] = None
                 if self.capture_screenshot:
                     screenshot = await page.screenshot(
