@@ -18,8 +18,8 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 jinja2>=3.1.4
 
-# Sandbox Verifier (installed inside Docker image as well)
-playwright>=1.48.0
+# Sandbox Verifier (pinned to match official Playwright Docker image)
+playwright==1.48.0
 
 # Testing
 pytest>=8.3.3
