@@ -64,7 +64,7 @@ class IngestUrlsRequest(BaseModel):
 
 
 class CollectRequest(BaseModel):
-    mode: Literal["tail", "crtsh"] = "tail"
+    mode: Literal["tail", "feeds", "crtsh"] = "tail"
     limit: int = Field(default=15, ge=1, le=100)
     duration: float = Field(default=15.0, ge=3.0, le=90.0)
     backfill: int = Field(default=2000, ge=100, le=10000)
@@ -177,7 +177,15 @@ def create_app(
                     tail_multi_ct_logs,
                 )
 
-                if req.mode == "crtsh":
+                if req.mode == "feeds":
+                    from src.discover import fetch_all_feeds
+
+                    candidates = await fetch_all_feeds(
+                        limit_per_feed=req.limit,
+                        indonesia_only=True,
+                        verbose=False,
+                    )
+                elif req.mode == "crtsh":
                     kws = req.keywords or list(DEFAULT_CRTSH_KEYWORDS)
                     candidates = await fetch_crtsh(
                         keywords=kws,
@@ -339,9 +347,19 @@ def create_app(
         reviewer: str,
         target_url: Optional[str],
     ) -> dict[str, Any]:
-        from src.submitter import submit_batch_playwright
+        from src.submitter import submit_batch_playwright, validate_submit_target_url
 
-        links = [str(it["normalized_url"]) for it in items if it.get("normalized_url")]
+        if target_url is not None:
+            try:
+                target_url = validate_submit_target_url(target_url)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        links = [
+            str(it.get("final_normalized_url") or it["normalized_url"])
+            for it in items
+            if it.get("final_normalized_url") or it.get("normalized_url")
+        ]
         run_submit = submitter_fn or submit_batch_playwright
         try:
             submit_res = await run_submit(links, reporter=reviewer, target_url=target_url)
@@ -361,7 +379,8 @@ def create_app(
             dup_set = set(res_dict.get("duplicate_links") or [])
             if dup_set:
                 for it in items:
-                    if it.get("normalized_url") in dup_set and it.get("id") is not None:
+                    effective_url = it.get("final_normalized_url") or it.get("normalized_url")
+                    if effective_url in dup_set and it.get("id") is not None:
                         await asyncio.to_thread(
                             cur_db.update_status,
                             int(it["id"]),
@@ -373,27 +392,39 @@ def create_app(
     @app.post("/api/pipeline/auto-submit")
     async def pipeline_auto_submit(payload: Optional[AutoSubmitRequest] = None) -> dict[str, Any]:
         """Auto-submit batch ke portal target via Playwright (mode: review_first | full_auto)."""
+        from src.submitter import validate_submit_target_url
+
         req = payload or AutoSubmitRequest()
+        if req.target_url is not None:
+            try:
+                validate_submit_target_url(req.target_url)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         reviewer = _resolve_reviewer(req.reviewer)
         cur_db = get_db()
         auto_approved = 0
 
         if req.mode == "full_auto":
+            # Only auto-approve items actually scored by AI above min_confidence;
+            # never promote un-triaged `verified` rows whose ai_category is only a keyword hint.
             candidates = await asyncio.to_thread(
                 cur_db.fetch_review_queue,
-                REVIEWABLE_STATUSES,
+                ("ai_scored", "triaged"),
                 req.limit * 2,
             )
             now_iso = datetime.now(timezone.utc).isoformat()
             for row in candidates:
                 if auto_approved >= req.limit:
                     break
+                row_status = str(row.get("status") or "")
+                if row_status not in ("triaged", "ai_scored"):
+                    continue
                 cat = str(row.get("ai_category") or "").strip().lower()
                 if cat not in ILLEGAL_AI_CATEGORIES:
                     continue
-                row_status = str(row.get("status") or "")
                 conf = row.get("ai_confidence")
-                if row_status in ("triaged", "ai_scored") and conf is not None and float(conf) < req.min_confidence:
+                if conf is None or float(conf) < req.min_confidence:
                     continue
                 await asyncio.to_thread(
                     cur_db.update_status,
@@ -440,11 +471,22 @@ def create_app(
         payload: Optional[BatchAutoSubmitRequest] = None,
     ) -> dict[str, Any]:
         """Submit ulang / kirim batch yang sudah di-export ke portal target via Playwright."""
+        from src.submitter import validate_submit_target_url
+
         req = payload or BatchAutoSubmitRequest()
+        if req.target_url is not None:
+            try:
+                validate_submit_target_url(req.target_url)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         reviewer = _resolve_reviewer(req.reviewer)
         cur_db = get_db()
-        batches = await asyncio.to_thread(cur_db.fetch_batches, 50)
-        target_batch = next((b for b in batches if int(b["id"]) == batch_id), None)
+        if hasattr(cur_db, "fetch_batch_by_id"):
+            target_batch = await asyncio.to_thread(cur_db.fetch_batch_by_id, batch_id)
+        else:
+            batches = await asyncio.to_thread(cur_db.fetch_batches, 50)
+            target_batch = next((b for b in batches if int(b["id"]) == batch_id), None)
         if target_batch is None or not target_batch.get("items"):
             raise HTTPException(status_code=404, detail=f"Batch #{batch_id} tidak ditemukan atau kosong.")
 

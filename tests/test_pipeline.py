@@ -561,7 +561,7 @@ class TestAppAtomicExport(unittest.TestCase):
         from fastapi.testclient import TestClient
         from src.app import create_app
         from src.mock_target import create_mock_app
-        from src.submitter import SubmitResult, detect_gate_or_captcha
+        from src.submitter import SubmitResult, detect_gate_or_captcha, validate_submit_target_url
 
         # 1. Mock portal accepts links & detects duplicates
         mock_client = TestClient(create_mock_app())
@@ -576,9 +576,26 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertEqual(sub_summary["submissions"][1]["duplicates"], ["slot88.id"])
         self.assertEqual(sub_summary["submissions"][1]["accepted"], ["baru77.id"])
 
-        # 2. CAPTCHA detector flags Turnstile/reCAPTCHA without attempting bypass
+        # 2. CAPTCHA & login detector flags Turnstile/reCAPTCHA/masuk without attempting bypass
         self.assertIsNotNone(detect_gate_or_captcha('<div class="cf-turnstile"></div>'))
+        self.assertIsNotNone(
+            detect_gate_or_captcha(
+                '<form><input type="password" name="pw"></form>',
+                current_url="https://imphnen.dev/masuk",
+            )
+        )
         self.assertIsNone(detect_gate_or_captcha('<form><textarea name="links"></textarea></form>'))
+
+        # 2b. SSRF target URL allowlist validation
+        self.assertEqual(validate_submit_target_url("http://127.0.0.1:8001"), "http://127.0.0.1:8001")
+        self.assertEqual(validate_submit_target_url("http://mock-target:8001"), "http://mock-target:8001")
+        self.assertEqual(validate_submit_target_url("https://imphnen.dev/hackaton-anti-judol"), "https://imphnen.dev/hackaton-anti-judol")
+        with self.assertRaises(ValueError):
+            validate_submit_target_url("http://169.254.169.254/latest/meta-data")
+        with self.assertRaises(ValueError):
+            validate_submit_target_url("file:///etc/passwd")
+        with self.assertRaises(ValueError):
+            validate_submit_target_url("https://evil.example.com/hook")
 
         # 3. Auto-submit endpoint supports BOTH review_first and full_auto modes
         class _SubmitDB:
@@ -589,10 +606,19 @@ class TestAppAtomicExport(unittest.TestCase):
                     2: {"id": 2, "normalized_url": "ai-high.id", "status": "triaged", "batch_id": None, "ai_category": "judol", "ai_confidence": 0.92},
                     3: {"id": 3, "normalized_url": "ai-benign.id", "status": "triaged", "batch_id": None, "ai_category": "benign", "ai_confidence": 0.99},
                     4: {"id": 4, "normalized_url": "ai-lowconf.id", "status": "triaged", "batch_id": None, "ai_category": "scam", "ai_confidence": 0.40},
+                    5: {"id": 5, "normalized_url": "untriaged-hint.id", "status": "verified", "batch_id": None, "ai_category": "judol", "ai_confidence": None},
+                    6: {"id": 6, "normalized_url": "triaged-nullconf.id", "status": "triaged", "batch_id": None, "ai_category": "judol", "ai_confidence": None},
                 }
 
             def fetch_review_queue(self, statuses, limit=30):
                 return [r for r in self.rows.values() if r["status"] in statuses][:limit]
+
+            def fetch_batch_by_id(self, batch_id):
+                items = [r for r in self.rows.values() if r.get("batch_id") == batch_id]
+                if not items:
+                    return None
+                links = [r.get("final_normalized_url") or r["normalized_url"] for r in items]
+                return {"id": batch_id, "reviewer": "member-1", "items": items, "links": links, "text": "\n".join(links)}
 
             def update_status(self, url_id, status=None, **fields):
                 row = self.rows[url_id]
@@ -626,14 +652,15 @@ class TestAppAtomicExport(unittest.TestCase):
         db = _SubmitDB()
         client = TestClient(create_app(db=db, submitter_fn=_fake_submitter))
 
-        # Mode A: review_first -> submits ONLY pre-approved row #1 (ignores triaged #2/#3/#4)
+        # Mode A: review_first -> submits ONLY pre-approved row #1 (ignores triaged #2/#3/#4 & verified #5)
         res_a = client.post("/api/pipeline/auto-submit", json={"reviewer": "member-1", "mode": "review_first"})
         self.assertEqual(res_a.status_code, 200)
         self.assertEqual(res_a.json()["links"], ["approved1.id"])
         self.assertEqual(db.rows[1]["status"], "submitted")
         self.assertEqual(db.rows[2]["status"], "triaged")
 
-        # Mode B: full_auto -> auto-promotes ONLY high-confidence illegal row #2 (ignores benign #3 & low-conf #4)
+        # Mode B: full_auto -> auto-promotes ONLY high-confidence triaged illegal row #2
+        # Must NEVER promote benign #3, low-conf #4, un-triaged verified #5, or null-confidence #6
         res_b = client.post("/api/pipeline/auto-submit", json={"reviewer": "member-1", "mode": "full_auto", "min_confidence": 0.80})
         self.assertEqual(res_b.status_code, 200)
         self.assertEqual(res_b.json()["auto_approved"], 1)
@@ -641,6 +668,26 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertEqual(db.rows[2]["status"], "submitted")
         self.assertEqual(db.rows[3]["status"], "triaged")
         self.assertEqual(db.rows[4]["status"], "triaged")
+        self.assertEqual(db.rows[5]["status"], "verified")
+        self.assertEqual(db.rows[6]["status"], "triaged")
+
+        # Mode C: SSRF override is rejected with HTTP 400 on both auto-submit endpoints
+        res_ssrf_1 = client.post(
+            "/api/pipeline/auto-submit",
+            json={"reviewer": "member-1", "mode": "review_first", "target_url": "http://169.254.169.254/latest/meta-data"},
+        )
+        self.assertEqual(res_ssrf_1.status_code, 400)
+
+        res_ssrf_2 = client.post(
+            "/api/batches/1/auto-submit",
+            json={"reviewer": "member-1", "target_url": "https://evil.example.com/hook"},
+        )
+        self.assertEqual(res_ssrf_2.status_code, 400)
+
+        # Mode D: Re-submitting an existing batch via fetch_batch_by_id succeeds with allowed target
+        res_batch = client.post("/api/batches/1/auto-submit", json={"reviewer": "member-1", "target_url": "http://127.0.0.1:8001"})
+        self.assertEqual(res_batch.status_code, 200)
+        self.assertEqual(res_batch.json()["submit"]["submitted_links"], ["approved1.id"])
 
 
 if __name__ == "__main__":

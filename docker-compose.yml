@@ -49,7 +49,7 @@ services:
       - SUBMIT_SUCCESS_SELECTOR=${SUBMIT_SUCCESS_SELECTOR:-[data-submit-status="ok"]}
     entrypoint: ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${DASHBOARD_BIND_HOST:-127.0.0.1}:8000:8000"
     restart: unless-stopped
 
   auto-worker:

@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS urls (
     ai_category TEXT,
     ai_confidence REAL,
     ai_note TEXT,
+    submit_mode TEXT NOT NULL DEFAULT 'batch',
+    judge_reason TEXT,
     locked_by TEXT,
     locked_at TIMESTAMPTZ,
     reviewed_by TEXT,
@@ -33,6 +35,10 @@ CREATE TABLE IF NOT EXISTS urls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (normalized_url)
 );
+
+-- Safe idempotent migration for existing Supabase instances.
+ALTER TABLE public.urls ADD COLUMN IF NOT EXISTS submit_mode TEXT NOT NULL DEFAULT 'batch';
+ALTER TABLE public.urls ADD COLUMN IF NOT EXISTS judge_reason TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_urls_status ON urls (status);
 CREATE INDEX IF NOT EXISTS idx_urls_batch_id ON urls (batch_id);
@@ -48,12 +54,12 @@ CREATE INDEX IF NOT EXISTS idx_urls_locked_by
 ALTER TABLE batches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE urls ENABLE ROW LEVEL SECURITY;
 
--- Atomic reviewer lock: klaim 1 URL spesifik atau antrean berikutnya tanpa bentrok antar reviewer.
+-- Atomic reviewer lock: klaim 1 URL spesifik atau antrean berikutnya (urut ai_confidence tertinggi).
 CREATE OR REPLACE FUNCTION public.claim_url_for_review(
     p_reviewer TEXT,
     p_url_id BIGINT DEFAULT NULL,
-    p_statuses TEXT[] DEFAULT ARRAY['verified', 'triaged'],
-    p_ttl_minutes INTEGER DEFAULT 15
+    p_statuses TEXT[] DEFAULT ARRAY['ai_scored', 'triaged', 'verified'],
+    p_ttl_minutes INTEGER DEFAULT 5
 )
 RETURNS SETOF public.urls
 LANGUAGE plpgsql
@@ -62,7 +68,7 @@ SET search_path = public
 AS $$
 DECLARE
     v_id BIGINT;
-    v_ttl INTERVAL := make_interval(mins => GREATEST(1, COALESCE(p_ttl_minutes, 15)));
+    v_ttl INTERVAL := make_interval(mins => GREATEST(1, COALESCE(p_ttl_minutes, 5)));
 BEGIN
     IF p_reviewer IS NULL OR btrim(p_reviewer) = '' THEN
         RAISE EXCEPTION 'p_reviewer is required';
@@ -87,7 +93,7 @@ BEGIN
               OR u.locked_by = p_reviewer
               OR u.locked_at < NOW() - v_ttl
           )
-        ORDER BY u.id ASC
+        ORDER BY u.ai_confidence DESC NULLS LAST, u.id ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED;
     END IF;
@@ -106,7 +112,7 @@ BEGIN
 END;
 $$;
 
--- Atomic Export Next 20 Links: buat record batches & tandai exported dalam 1 transaksi (anti bentrok 3 orang).
+-- Atomic Export Next 20 Links: kembalikan final_normalized_url (jika redirect) dalam 1 transaksi.
 CREATE OR REPLACE FUNCTION public.export_next_batch(
     p_reviewer TEXT,
     p_limit INTEGER DEFAULT 20
@@ -157,7 +163,12 @@ BEGIN
         locked_at = NULL,
         updated_at = NOW()
     WHERE u.id = ANY(v_ids)
-    RETURNING v_batch_id, u.id, u.normalized_url, u.ai_category, u.ai_note;
+    RETURNING
+        v_batch_id,
+        u.id,
+        COALESCE(u.final_normalized_url, u.normalized_url),
+        u.ai_category,
+        u.ai_note;
 END;
 $$;
 
