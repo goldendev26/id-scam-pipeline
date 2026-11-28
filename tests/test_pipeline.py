@@ -366,8 +366,8 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertIn("Auto Pipeline", html.text)
         self.assertIn("Mulai Otomatis", html.text)
         self.assertIn('id="btnTheme"', html.text)
-        self.assertIn('href="/static/styles.css"', html.text)
-        self.assertIn('src="/static/app.js"', html.text)
+        self.assertIn('href="/static/styles.css?v=', html.text)
+        self.assertIn('src="/static/app.js?v=', html.text)
 
         css = client.get("/static/styles.css")
         self.assertEqual(css.status_code, 200)
@@ -567,6 +567,15 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertEqual(r_imp.status_code, 200)
         self.assertEqual(r_imp.json()["imported_count"], 2)
         self.assertEqual(db.rows[1]["status"], "triaged")
+
+        # 5. Re-verify approved keeps still-live URL as approved
+        db.rows[1]["status"] = "approved"
+        db.rows[1]["batch_id"] = None
+        r_rev = client.post("/api/pipeline/reverify-approved", json={"limit": 10})
+        self.assertEqual(r_rev.status_code, 200)
+        self.assertEqual(r_rev.json()["still_approved"], 1)
+        self.assertEqual(r_rev.json()["dead_or_blocked"], 0)
+        self.assertEqual(db.rows[1]["status"], "approved")
 
     def test_mock_target_and_auto_submit_both_modes(self):
         from fastapi.testclient import TestClient

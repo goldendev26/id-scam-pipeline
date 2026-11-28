@@ -344,6 +344,35 @@
     }
   }
 
+  async function runReverifyApproved() {
+    const btn = document.getElementById("btnReverifyApproved");
+    const limit = Math.max(1, Math.min(20, Number(els.verifyLimit.value) || 5));
+    btn.disabled = true;
+    els.statusVerify.textContent = `Cek ulang ${limit} Approved terlama...`;
+    showToast(`Mengecek ulang ${limit} link Approved terlama...`);
+    try {
+      const { res, data } = await postJson("/api/pipeline/reverify-approved", {
+        limit,
+        concurrency: 4,
+        timeout_ms: 9000,
+      });
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      if (!data.processed) {
+        els.statusVerify.textContent = "Belum ada link Approved";
+        showToast("Belum ada link berstatus Approved untuk dicek ulang.");
+        return;
+      }
+      els.statusVerify.textContent = `${data.still_approved} masih hidup · ${data.dead_or_blocked} gugur`;
+      showToast(`Cek ulang Approved: ${data.still_approved} hidup, ${data.dead_or_blocked} mati/Trust+.`);
+      await loadQueue();
+    } catch (err) {
+      els.statusVerify.textContent = err.message;
+      showToast(`Cek ulang gagal: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   async function runTriageApi() {
     const btn = document.getElementById("btnTriageApi");
     btn.disabled = true;
@@ -784,7 +813,7 @@
   const btnTheme = document.getElementById("btnTheme");
   function syncThemeButton() {
     const isLight = document.documentElement.dataset.theme === "light";
-    btnTheme.textContent = isLight ? "Gelap" : "Terang";
+    btnTheme.textContent = isLight ? "Dark" : "Light";
   }
   syncThemeButton();
   btnTheme.addEventListener("click", () => {
@@ -794,8 +823,11 @@
     syncThemeButton();
   });
 
-  document.getElementById("btnToggleWorkbench").addEventListener("click", () => {
-    els.workbench.classList.toggle("collapsed");
+  const btnToggleWorkbench = document.getElementById("btnToggleWorkbench");
+  btnToggleWorkbench.addEventListener("click", () => {
+    const collapsed = els.workbench.classList.toggle("collapsed");
+    btnToggleWorkbench.setAttribute("aria-expanded", String(!collapsed));
+    btnToggleWorkbench.textContent = collapsed ? "Alat Manual +" : "Tutup Alat -";
   });
   els.btnAutoOnce.addEventListener("click", runAutoCycle);
   els.btnAutoLoop.addEventListener("click", toggleAutoLoop);
@@ -803,6 +835,7 @@
   document.getElementById("btnCollect").addEventListener("click", runCollect);
   document.getElementById("btnIngest").addEventListener("click", runIngest);
   document.getElementById("btnVerify").addEventListener("click", runVerifyQueue);
+  document.getElementById("btnReverifyApproved").addEventListener("click", runReverifyApproved);
   document.getElementById("btnTriageApi").addEventListener("click", runTriageApi);
   document.getElementById("btnTriageExport").addEventListener("click", runTriageExportPrompts);
   document.getElementById("btnTriageImport").addEventListener("click", runTriageImport);

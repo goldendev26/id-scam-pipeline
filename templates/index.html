@@ -6,7 +6,7 @@
   <title>id-scam-pipeline - Review Workbench</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <script>
     (function () {
       const saved = localStorage.getItem("theme");
@@ -14,8 +14,8 @@
       document.documentElement.dataset.theme = pref;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css" />
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}" />
+  <script src="/static/app.js?v={{ asset_version }}" defer></script>
 </head>
 <body>
   <header>
@@ -25,11 +25,12 @@
         <span>id-scam-pipeline</span>
       </div>
       <div class="metrics" id="statsBar" aria-label="Ringkasan status antrean">
-        <span class="metric">New <strong id="cntNew">0</strong></span>
-        <span class="metric">Review <strong id="cntQueue">0</strong></span>
+        <span class="metric metric-primary">Review <strong id="cntQueue">0</strong></span>
         <span class="metric metric-highlight">Approved <strong id="cntApproved">0</strong></span>
+        <span class="metric metric-primary">Submitted <strong id="cntSubmitted">0</strong></span>
+        <span class="metric-sep" aria-hidden="true"></span>
+        <span class="metric">New <strong id="cntNew">0</strong></span>
         <span class="metric">Exported <strong id="cntExported">0</strong></span>
-        <span class="metric">Submitted <strong id="cntSubmitted">0</strong></span>
         <span class="metric">Claimed <strong id="cntClaimed">0</strong></span>
         <span class="metric">Skipped <strong id="cntSkipped">0</strong></span>
       </div>
@@ -39,7 +40,7 @@
         <span>@</span>
         <input id="reviewerInput" type="text" value="{{ default_reviewer }}" aria-label="Nama reviewer" />
       </label>
-      <button id="btnTheme" type="button" class="btn-ghost" title="Ganti tema Gelap / Terang" aria-label="Ganti tema">Terang</button>
+      <button id="btnTheme" type="button" class="btn-ghost" title="Ganti tema Dark / Light" aria-label="Ganti tema">Light</button>
       <button id="btnRefresh" type="button" class="btn-ghost">Refresh</button>
       <button id="btnAutoSubmitNow" type="button" class="btn-outline" title="Kirim batch ke portal target via Playwright sesuai mode aktif">Auto Submit</button>
       <button id="btnExport" type="button" class="btn-primary">Copy Next 20 Links</button>
@@ -47,16 +48,15 @@
   </header>
 
   <div class="shell">
-    <section class="workbench" id="workbench" aria-label="Pipeline control">
+    <section class="workbench collapsed" id="workbench" aria-label="Pipeline control">
       <div class="auto-strip">
         <div class="auto-left">
           <span class="auto-title">
             <span id="autoDot" class="auto-dot"></span>
             Auto Pipeline
           </span>
-          <span class="flow-crumbs">Discover &rsaquo; Capture &rsaquo; Triage &rsaquo; Submit</span>
-          <a href="{{ portal_browser_url }}" target="_blank" rel="noopener noreferrer" class="count-tag portal-link" title="Buka website target pelaporan ({{ submit_target_url }})">Portal Target &#8599;</a>
           <span id="statusAuto" class="auto-status">Siap</span>
+          <a href="{{ portal_browser_url }}" target="_blank" rel="noopener noreferrer" class="count-tag portal-link" title="Buka website target pelaporan ({{ submit_target_url }})">Portal Target &#8599;</a>
         </div>
         <div class="auto-controls">
           <label class="inline-field" title="Pilih alur submit: Review Dulu (aman) atau Auto Submit langsung untuk hasil AI ilegal">
@@ -75,9 +75,9 @@
             <input id="autoIncludeAi" type="checkbox" checked />
             <span>AI API</span>
           </label>
-          <button id="btnAutoOnce" type="button" class="btn-outline">Jalankan 1x</button>
+          <button id="btnAutoOnce" type="button" class="btn-ghost">1x</button>
           <button id="btnAutoLoop" type="button" class="btn-approve">Mulai Otomatis</button>
-          <button id="btnToggleWorkbench" type="button" class="btn-ghost" title="Sembunyikan / tampilkan alat manual">Alat</button>
+          <button id="btnToggleWorkbench" type="button" class="btn-outline" aria-expanded="false" title="Buka / tutup 4 alat manual (CT Discovery, Manual URLs, Capture, AI Triage)">Alat Manual +</button>
         </div>
       </div>
 
@@ -126,6 +126,7 @@
           </div>
           <div class="tool-foot">
             <button id="btnVerify" type="button" class="btn-outline btn-full">Verifikasi &amp; Screenshot</button>
+            <button id="btnReverifyApproved" type="button" class="btn-ghost btn-full" title="Cek ulang link Approved sebelum hari-H; yang mati atau terblokir Trust+ otomatis dibuang">Cek Ulang Approved</button>
             <div id="statusVerify" class="tool-note"></div>
           </div>
         </div>

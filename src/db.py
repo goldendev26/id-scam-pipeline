@@ -129,13 +129,19 @@ class SupabaseDB:
         inserted = self.insert_urls([raw_url], source=source, status=status)
         return inserted[0] if inserted else None
 
-    def fetch_queue(self, status: str = "new", limit: int = 50) -> list[dict[str, Any]]:
+    def fetch_queue(
+        self,
+        status: str = "new",
+        limit: int = 50,
+        *,
+        order: str = "id.asc",
+    ) -> list[dict[str, Any]]:
         """Ambil antrean URL berdasarkan status (default 'new'), urut paling lama."""
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
             params={
                 "status": f"eq.{status}",
-                "order": "id.asc",
+                "order": order,
                 "limit": str(max(1, limit)),
             },
             headers=self._headers(),
