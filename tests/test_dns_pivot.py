@@ -1,4 +1,4 @@
-"""Unit tests for src.dns_pivot (FR-PIVOT-001, Task #33)."""
+"""Unit tests for src.dns_pivot"""
 
 import unittest
 

@@ -1,4 +1,4 @@
-"""Unit tests for src.verify (FR-VERIF-001, Task #12)."""
+"""Unit tests for src.verify"""
 
 from pathlib import Path
 import tempfile
