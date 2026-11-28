@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from src.normalizer import normalize_url
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("VERIFY_TIMEOUT_MS", "15000"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("SCREENSHOT_JPEG_QUALITY", "60"))
+DEFAULT_MAX_SCREENSHOT_BYTES = int(os.getenv("MAX_SCREENSHOT_BYTES", str(150 * 1024)))
 DEFAULT_NETWORK_IDLE_MS = 3000
 DEFAULT_CONCURRENCY = 4
 
@@ -79,6 +81,7 @@ class VerifyResult:
     page_title: Optional[str] = None
     raw_html: Optional[str] = None
     screenshot_bytes: Optional[bytes] = None
+    screenshot_path: Optional[str] = None
     error_code: Optional[str] = None
     error_detail: Optional[str] = None
     elapsed_ms: int = 0
@@ -94,10 +97,54 @@ class VerifyResult:
             "page_title": self.page_title,
             "html_bytes": len(self.raw_html.encode("utf-8")) if self.raw_html else 0,
             "screenshot_bytes": len(self.screenshot_bytes) if self.screenshot_bytes else 0,
+            "screenshot_path": self.screenshot_path,
             "error_code": self.error_code,
             "error_detail": self.error_detail,
             "elapsed_ms": self.elapsed_ms,
         }
+
+
+def compress_jpeg_to_limit(
+    jpeg_bytes: bytes,
+    max_bytes: int = DEFAULT_MAX_SCREENSHOT_BYTES,
+    initial_quality: int = DEFAULT_JPEG_QUALITY,
+) -> bytes:
+    """Ensure JPEG bytes fit within max_bytes (default 150 KB) via Pillow quality/scale steps."""
+    if not jpeg_bytes or len(jpeg_bytes) <= max_bytes:
+        return jpeg_bytes
+
+    from PIL import Image
+
+    with Image.open(BytesIO(jpeg_bytes)) as img:
+        rgb = img.convert("RGB")
+        qualities = [q for q in (initial_quality, 50, 40, 30, 22, 15) if q <= initial_quality]
+        if not qualities:
+            qualities = [initial_quality]
+
+        best = jpeg_bytes
+        for quality in qualities:
+            buf = BytesIO()
+            rgb.save(buf, format="JPEG", quality=quality, optimize=True)
+            candidate = buf.getvalue()
+            if len(candidate) < len(best):
+                best = candidate
+            if len(candidate) <= max_bytes:
+                return candidate
+
+        cur = rgb
+        while cur.width > 320 and len(best) > max_bytes:
+            new_size = (max(320, int(cur.width * 0.8)), max(180, int(cur.height * 0.8)))
+            cur = cur.resize(new_size, Image.Resampling.LANCZOS)
+            for quality in (35, 25, 18):
+                buf = BytesIO()
+                cur.save(buf, format="JPEG", quality=quality, optimize=True)
+                candidate = buf.getvalue()
+                if len(candidate) < len(best):
+                    best = candidate
+                if len(candidate) <= max_bytes:
+                    return candidate
+
+        return best
 
 
 def should_abort_request(resource_type: str, url: str) -> bool:
@@ -286,14 +333,18 @@ class SafeBrowserVerifier:
         self,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+        max_screenshot_bytes: int = DEFAULT_MAX_SCREENSHOT_BYTES,
         network_idle_ms: int = DEFAULT_NETWORK_IDLE_MS,
         capture_screenshot: bool = True,
+        uploader: Optional[Callable[[str, bytes], str]] = None,
         playwright_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.timeout_ms = timeout_ms
         self.jpeg_quality = jpeg_quality
+        self.max_screenshot_bytes = max_screenshot_bytes
         self.network_idle_ms = network_idle_ms
         self.capture_screenshot = capture_screenshot
+        self.uploader = uploader
         self._playwright_factory = playwright_factory
         self._playwright_cm: Any = None
         self._playwright: Any = None
@@ -322,7 +373,7 @@ class SafeBrowserVerifier:
             self._playwright_cm = None
             self._playwright = None
 
-    async def verify_url(self, raw_url: str) -> VerifyResult:
+    async def verify_url(self, raw_url: str, url_id: Optional[int] = None) -> VerifyResult:
         """Open a single URL in a disposable context and collect redirect + page artifacts."""
         started = time.monotonic()
 
@@ -441,12 +492,28 @@ class SafeBrowserVerifier:
                     )
 
                 screenshot: Optional[bytes] = None
+                screenshot_path: Optional[str] = None
                 if self.capture_screenshot:
-                    screenshot = await page.screenshot(
+                    raw_shot = await page.screenshot(
                         type="jpeg",
                         quality=self.jpeg_quality,
                         full_page=False,
                     )
+                    screenshot = compress_jpeg_to_limit(
+                        raw_shot,
+                        max_bytes=self.max_screenshot_bytes,
+                        initial_quality=self.jpeg_quality,
+                    )
+                    if self.uploader is not None and screenshot:
+                        target_key = build_screenshot_path(
+                            final_norm.normalized or norm.normalized,
+                            url_id=url_id,
+                        )
+                        screenshot_path = await asyncio.to_thread(
+                            self.uploader,
+                            target_key,
+                            screenshot,
+                        )
 
                 return VerifyResult(
                     input_url=raw_url,
@@ -458,6 +525,7 @@ class SafeBrowserVerifier:
                     page_title=title,
                     raw_html=raw_html,
                     screenshot_bytes=screenshot,
+                    screenshot_path=screenshot_path,
                     elapsed_ms=int((time.monotonic() - started) * 1000),
                 )
             except Exception as exc:
@@ -501,6 +569,29 @@ def _safe_filename(normalized_url: str) -> str:
     return (cleaned[:120] or "page") + ".jpg"
 
 
+def build_screenshot_path(normalized_url: str, url_id: Optional[int] = None) -> str:
+    """Build a sanitized Supabase Storage object path for a screenshot JPEG."""
+    name = _safe_filename(normalized_url)
+    return f"{url_id}_{name}" if url_id is not None else name
+
+
+def upload_verify_screenshot(
+    res: VerifyResult,
+    db: Any,
+    url_id: Optional[int] = None,
+    max_bytes: int = DEFAULT_MAX_SCREENSHOT_BYTES,
+) -> Optional[str]:
+    """Compress (<= 150 KB) and upload a VerifyResult screenshot to Supabase Storage."""
+    if not res.screenshot_bytes:
+        return None
+    jpeg = compress_jpeg_to_limit(res.screenshot_bytes, max_bytes=max_bytes)
+    storage_path = build_screenshot_path(
+        res.final_normalized_url or res.normalized_url or "page",
+        url_id=url_id,
+    )
+    return db.upload_screenshot(storage_path, jpeg)
+
+
 def save_debug_screenshot(res: VerifyResult, out_dir: Path) -> Optional[Path]:
     """Write JPEG bytes to disk for local debug inspection only."""
     if not res.screenshot_bytes:
@@ -516,9 +607,22 @@ async def _run_cli(
     urls: Sequence[str],
     concurrency: int,
     out_dir: Optional[Path] = None,
+    upload: bool = False,
 ) -> int:
-    async with SafeBrowserVerifier() as verifier:
-        results = await verifier.verify_many(urls, concurrency=concurrency)
+    db = None
+    uploader = None
+    if upload:
+        from src.db import SupabaseDB
+
+        db = SupabaseDB.from_env()
+        uploader = db.upload_screenshot
+    try:
+        async with SafeBrowserVerifier(uploader=uploader) as verifier:
+            results = await verifier.verify_many(urls, concurrency=concurrency)
+    finally:
+        if db is not None:
+            db.close()
+
     for res in results:
         summary = res.to_summary_dict()
         if out_dir is not None:
@@ -542,6 +646,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Optional debug directory to save captured JPEG screenshots.",
     )
     parser.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload compressed JPEG screenshots (<= 150 KB) to Supabase Storage.",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=DEFAULT_CONCURRENCY,
@@ -549,7 +658,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
     return asyncio.run(
-        _run_cli(args.urls, concurrency=args.concurrency, out_dir=args.out_dir)
+        _run_cli(
+            args.urls,
+            concurrency=args.concurrency,
+            out_dir=args.out_dir,
+            upload=args.upload,
+        )
     )
 
 
