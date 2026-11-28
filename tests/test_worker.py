@@ -71,9 +71,35 @@ class TestAutomatedWorker(unittest.IsolatedAsyncioTestCase):
             ]
 
         disc = await run_discover_pass(db, collector_fn=fake_collect)
-        self.assertEqual(disc, {"stage": "discover", "found": 1, "inserted": 1})
+        self.assertEqual(
+            disc,
+            {"stage": "discover", "found": 1, "ct_found": 1, "feed_found": 0, "inserted": 1},
+        )
         self.assertEqual(len(db.rows), 1)
         self.assertEqual(db.rows[0]["status"], "new")
+
+        async def fake_feeds(**kwargs):
+            return [
+                SimpleNamespace(
+                    raw_url="https://bri-login-palsu.xyz",
+                    normalized_url="bri-login-palsu.xyz",
+                    source="openphish",
+                    category_hint="phishing",
+                    matched_rule="brand:bri",
+                )
+            ]
+
+        disc_feeds = await run_discover_pass(
+            db,
+            collector_fn=fake_collect,
+            feeds_fn=fake_feeds,
+            include_feeds=True,
+        )
+        self.assertEqual(disc_feeds["ct_found"], 1)
+        self.assertEqual(disc_feeds["feed_found"], 1)
+        self.assertEqual(disc_feeds["inserted"], 1)
+        # Keep only the original CT row for the rest of the single-cycle check
+        db.rows = db.rows[:1]
 
         browser = _FakeBrowser(
             lambda u: {
