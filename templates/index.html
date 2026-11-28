@@ -887,6 +887,7 @@
       </label>
       <button id="btnTheme" type="button" class="btn-ghost" title="Ganti tema Gelap / Terang" aria-label="Ganti tema">Terang</button>
       <button id="btnRefresh" type="button" class="btn-ghost">Refresh</button>
+      <button id="btnAutoSubmitNow" type="button" class="btn-outline" title="Kirim batch ke portal target via Playwright sesuai mode aktif">Auto Submit</button>
       <button id="btnExport" type="button" class="btn-primary">Copy Next 20 Links</button>
     </div>
   </header>
@@ -899,10 +900,18 @@
             <span id="autoDot" class="auto-dot"></span>
             Auto Pipeline
           </span>
-          <span class="flow-crumbs">Discover &rsaquo; Capture &rsaquo; Triage</span>
+          <span class="flow-crumbs">Discover &rsaquo; Capture &rsaquo; Triage &rsaquo; Submit</span>
+          <a href="{{ portal_browser_url }}" target="_blank" rel="noopener noreferrer" class="count-tag" style="text-decoration:none;" title="Buka website target pelaporan ({{ submit_target_url }})">Portal Target &#8599;</a>
           <span id="statusAuto" class="auto-status">Siap</span>
         </div>
         <div class="auto-controls">
+          <label class="inline-field" title="Pilih alur submit: Review Dulu (aman) atau Auto Submit langsung untuk hasil AI ilegal">
+            <span>Mode</span>
+            <select id="autoSubmitMode" aria-label="Mode submit" style="height:28px;">
+              <option value="review_first">Review Dulu</option>
+              <option value="full_auto">Auto Submit (AI)</option>
+            </select>
+          </label>
           <label class="inline-field" title="Jeda antar siklus otomatis (detik)">
             <span>Jeda</span>
             <input id="autoInterval" type="number" min="10" max="600" value="30" />
@@ -1096,10 +1105,12 @@
       cntClaimed: document.getElementById("cntClaimed"),
       cntSkipped: document.getElementById("cntSkipped"),
       autoDot: document.getElementById("autoDot"),
+      autoSubmitMode: document.getElementById("autoSubmitMode"),
       autoInterval: document.getElementById("autoInterval"),
       autoIncludeAi: document.getElementById("autoIncludeAi"),
       btnAutoOnce: document.getElementById("btnAutoOnce"),
       btnAutoLoop: document.getElementById("btnAutoLoop"),
+      btnAutoSubmitNow: document.getElementById("btnAutoSubmitNow"),
       statusAuto: document.getElementById("statusAuto"),
       collectMode: document.getElementById("collectMode"),
       collectLimit: document.getElementById("collectLimit"),
@@ -1252,9 +1263,27 @@
           }
         }
 
-        await loadQueue();
-        els.statusAuto.textContent = `#${cycle} selesai · +${colData.inserted_count} URL · ${verData.verified} capture · ${aiSummary}`;
-        showToast(`Auto #${cycle}: +${colData.inserted_count} URL, ${verData.verified} siap review.`);
+        let submitSummary = "Review dulu";
+        if (els.autoSubmitMode.value === "full_auto") {
+          els.statusAuto.textContent = `#${cycle} · Auto Submit ke portal target...`;
+          const subRes = await fetch("/api/pipeline/auto-submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reviewer: getReviewer(), mode: "full_auto", limit: 20 }),
+          });
+          const subData = await subRes.json().catch(() => ({}));
+          if (subRes.ok && subData.submit && subData.submit.ok) {
+            submitSummary = `Submit #${subData.batch_id} (${subData.count})`;
+          } else if (subRes.ok && !subData.count) {
+            submitSummary = "Submit 0";
+          } else {
+            submitSummary = `Submit: ${(subData.submit && subData.submit.detail) || subData.detail || subRes.status}`;
+          }
+        }
+
+        await Promise.all([loadQueue(), loadBatches()]);
+        els.statusAuto.textContent = `#${cycle} selesai · +${colData.inserted_count} URL · ${verData.verified} capture · ${aiSummary} · ${submitSummary}`;
+        showToast(`Auto #${cycle}: +${colData.inserted_count} URL, ${verData.verified} capture, ${submitSummary}.`);
       } catch (err) {
         els.statusAuto.textContent = `#${cycle} error: ${err.message}`;
         showToast(`Auto pipeline error: ${err.message}`);
@@ -1510,6 +1539,7 @@
               </div>
               <div class="batch-actions">
                 <button type="button" class="btn-outline" data-batch-copy="${b.id}">Copy</button>
+                <button type="button" class="btn-outline" data-batch-autosubmit="${b.id}" title="Kirim batch ini ke portal target via Playwright">Auto Submit</button>
                 <button type="button" class="btn-approve" data-batch-status="submitted" data-batch-id="${b.id}">Tandai Submitted</button>
                 <button type="button" class="btn-warn" data-batch-status="claimed_external" data-batch-id="${b.id}">Claimed External</button>
               </div>
@@ -1768,6 +1798,62 @@
       }
     }
 
+    async function runAutoSubmitNow() {
+      const mode = els.autoSubmitMode.value;
+      els.btnAutoSubmitNow.disabled = true;
+      els.statusAuto.textContent = `Auto Submit (${mode}) ke portal target...`;
+      try {
+        const res = await fetch("/api/pipeline/auto-submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reviewer: getReviewer(), mode, limit: 20 }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        if (!data.count) {
+          const msg = mode === "review_first"
+            ? "Belum ada link Approved (approve dulu dengan A/N, atau pilih mode Auto Submit AI)."
+            : "Belum ada link AI ilegal siap auto-submit.";
+          els.statusAuto.textContent = msg;
+          showToast(msg);
+          return;
+        }
+        const sub = data.submit || {};
+        if (sub.ok) {
+          const dupCount = (sub.duplicate_links || []).length;
+          els.statusAuto.textContent = `Batch #${data.batch_id} terkirim (${data.count} link, ${dupCount} dup).`;
+          showToast(`Batch #${data.batch_id} berhasil di-submit ke portal target!`);
+        } else {
+          els.statusAuto.textContent = `Batch #${data.batch_id} tertahan: ${sub.detail || "gagal"} (tersimpan di Riwayat Batch).`;
+          showToast(`Auto Submit tertahan: ${sub.detail || "cek Riwayat Batch"}.`);
+        }
+        await Promise.all([loadQueue(), loadBatches()]);
+      } catch (err) {
+        els.statusAuto.textContent = `Auto Submit error: ${err.message}`;
+        showToast(`Auto Submit gagal: ${err.message}`);
+      } finally {
+        els.btnAutoSubmitNow.disabled = false;
+      }
+    }
+
+    async function autoSubmitBatchById(batchId) {
+      showToast(`Mengirim Batch #${batchId} ke portal target...`);
+      try {
+        const res = await fetch(`/api/batches/${batchId}/auto-submit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reviewer: getReviewer() }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        const sub = data.submit || {};
+        showToast(sub.ok ? `Batch #${batchId} terkirim ke portal target!` : `Batch #${batchId}: ${sub.detail || "gagal"}`);
+        await Promise.all([loadQueue(), loadBatches()]);
+      } catch (err) {
+        showToast(`Auto Submit Batch #${batchId} gagal: ${err.message}`);
+      }
+    }
+
     els.batchesList.addEventListener("click", async (ev) => {
       const copyBtn = ev.target.closest("button[data-batch-copy]");
       if (copyBtn) {
@@ -1777,6 +1863,11 @@
           await copyText(batch.text);
           showToast(`Batch #${bid} (${batch.links.length} link) disalin.`);
         }
+        return;
+      }
+      const autoSubBtn = ev.target.closest("button[data-batch-autosubmit]");
+      if (autoSubBtn) {
+        await autoSubmitBatchById(Number(autoSubBtn.dataset.batchAutosubmit));
         return;
       }
       const batchStatusBtn = ev.target.closest("button[data-batch-status]");
@@ -1827,6 +1918,7 @@
     });
     els.btnAutoOnce.addEventListener("click", runAutoCycle);
     els.btnAutoLoop.addEventListener("click", toggleAutoLoop);
+    els.btnAutoSubmitNow.addEventListener("click", runAutoSubmitNow);
     document.getElementById("btnCollect").addEventListener("click", runCollect);
     document.getElementById("btnIngest").addEventListener("click", runIngest);
     document.getElementById("btnVerify").addEventListener("click", runVerifyQueue);

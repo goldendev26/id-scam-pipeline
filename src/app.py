@@ -19,12 +19,26 @@ from src.normalizer import MAX_BATCH_ITEMS
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 REVIEWABLE_STATUSES = ("ai_scored", "triaged", "verified")
+ILLEGAL_AI_CATEGORIES = frozenset({"judol", "pinjol", "phishing", "scam"})
 MAX_NOTE_CHARS = 140
 
 
 class ExportNextRequest(BaseModel):
     reviewer: Optional[str] = Field(default=None, description="Nama reviewer (default dari REVIEWER_NAME).")
     limit: int = Field(default=MAX_BATCH_ITEMS, ge=1, le=MAX_BATCH_ITEMS)
+
+
+class AutoSubmitRequest(BaseModel):
+    reviewer: Optional[str] = None
+    mode: Literal["review_first", "full_auto"] = "review_first"
+    limit: int = Field(default=MAX_BATCH_ITEMS, ge=1, le=MAX_BATCH_ITEMS)
+    min_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
+    target_url: Optional[str] = None
+
+
+class BatchAutoSubmitRequest(BaseModel):
+    reviewer: Optional[str] = None
+    target_url: Optional[str] = None
 
 
 class ReviewLockRequest(BaseModel):
@@ -104,6 +118,7 @@ def create_app(
     verifier_factory: Optional[Any] = None,
     collector_fn: Optional[Any] = None,
     ai_client: Optional[Any] = None,
+    submitter_fn: Optional[Any] = None,
 ) -> FastAPI:
     app = FastAPI(title="id-scam-pipeline Review Dashboard")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -118,10 +133,16 @@ def create_app(
     def index(request: Request) -> HTMLResponse:
         load_dotenv()
         default_reviewer = os.getenv("REVIEWER_NAME", "member-1").strip() or "member-1"
+        raw_target = os.getenv("SUBMIT_TARGET_URL", "http://127.0.0.1:8001").strip() or "http://127.0.0.1:8001"
+        portal_browser_url = raw_target.replace("http://mock-target:", "http://127.0.0.1:")
         return templates.TemplateResponse(
             request=request,
             name="index.html",
-            context={"default_reviewer": default_reviewer},
+            context={
+                "default_reviewer": default_reviewer,
+                "submit_target_url": raw_target,
+                "portal_browser_url": portal_browser_url,
+            },
         )
 
     @app.get("/health")
@@ -310,6 +331,131 @@ def create_app(
             )
             triaged.append(res.to_dict())
         return {"triaged_count": len(triaged), "items": triaged}
+
+    async def _run_submit_and_record(
+        cur_db: Any,
+        batch_id: int,
+        items: list[dict[str, Any]],
+        reviewer: str,
+        target_url: Optional[str],
+    ) -> dict[str, Any]:
+        from src.submitter import submit_batch_playwright
+
+        links = [str(it["normalized_url"]) for it in items if it.get("normalized_url")]
+        run_submit = submitter_fn or submit_batch_playwright
+        try:
+            submit_res = await run_submit(links, reporter=reviewer, target_url=target_url)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "failed",
+                "target_url": target_url or os.getenv("SUBMIT_TARGET_URL", "http://127.0.0.1:8001"),
+                "submitted_links": [],
+                "duplicate_links": [],
+                "detail": f"Gagal membuka portal target: {exc}",
+            }
+
+        res_dict = submit_res.to_dict() if hasattr(submit_res, "to_dict") else dict(submit_res)
+        if res_dict.get("ok"):
+            await asyncio.to_thread(cur_db.update_batch_urls_status, batch_id, "submitted", reviewer)
+            dup_set = set(res_dict.get("duplicate_links") or [])
+            if dup_set:
+                for it in items:
+                    if it.get("normalized_url") in dup_set and it.get("id") is not None:
+                        await asyncio.to_thread(
+                            cur_db.update_status,
+                            int(it["id"]),
+                            "claimed_external",
+                            reviewed_by=reviewer,
+                        )
+        return res_dict
+
+    @app.post("/api/pipeline/auto-submit")
+    async def pipeline_auto_submit(payload: Optional[AutoSubmitRequest] = None) -> dict[str, Any]:
+        """Auto-submit batch ke portal target via Playwright (mode: review_first | full_auto)."""
+        req = payload or AutoSubmitRequest()
+        reviewer = _resolve_reviewer(req.reviewer)
+        cur_db = get_db()
+        auto_approved = 0
+
+        if req.mode == "full_auto":
+            candidates = await asyncio.to_thread(
+                cur_db.fetch_review_queue,
+                REVIEWABLE_STATUSES,
+                req.limit * 2,
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for row in candidates:
+                if auto_approved >= req.limit:
+                    break
+                cat = str(row.get("ai_category") or "").strip().lower()
+                if cat not in ILLEGAL_AI_CATEGORIES:
+                    continue
+                row_status = str(row.get("status") or "")
+                conf = row.get("ai_confidence")
+                if row_status in ("triaged", "ai_scored") and conf is not None and float(conf) < req.min_confidence:
+                    continue
+                await asyncio.to_thread(
+                    cur_db.update_status,
+                    int(row["id"]),
+                    "approved",
+                    reviewed_by=f"auto:{reviewer}",
+                    reviewed_at=now_iso,
+                    locked_by=None,
+                    locked_at=None,
+                )
+                auto_approved += 1
+
+        batch = await asyncio.to_thread(cur_db.export_next_batch, reviewer, req.limit)
+        if not batch.get("count") or batch.get("batch_id") is None:
+            return {
+                "mode": req.mode,
+                "auto_approved": auto_approved,
+                "batch_id": None,
+                "count": 0,
+                "links": [],
+                "submit": None,
+                "detail": "Tidak ada link siap submit untuk mode ini.",
+            }
+
+        submit_dict = await _run_submit_and_record(
+            cur_db=cur_db,
+            batch_id=int(batch["batch_id"]),
+            items=batch.get("items") or [],
+            reviewer=reviewer,
+            target_url=req.target_url,
+        )
+        return {
+            "mode": req.mode,
+            "auto_approved": auto_approved,
+            "batch_id": batch["batch_id"],
+            "count": batch["count"],
+            "links": batch["links"],
+            "submit": submit_dict,
+        }
+
+    @app.post("/api/batches/{batch_id}/auto-submit")
+    async def auto_submit_existing_batch(
+        batch_id: int,
+        payload: Optional[BatchAutoSubmitRequest] = None,
+    ) -> dict[str, Any]:
+        """Submit ulang / kirim batch yang sudah di-export ke portal target via Playwright."""
+        req = payload or BatchAutoSubmitRequest()
+        reviewer = _resolve_reviewer(req.reviewer)
+        cur_db = get_db()
+        batches = await asyncio.to_thread(cur_db.fetch_batches, 50)
+        target_batch = next((b for b in batches if int(b["id"]) == batch_id), None)
+        if target_batch is None or not target_batch.get("items"):
+            raise HTTPException(status_code=404, detail=f"Batch #{batch_id} tidak ditemukan atau kosong.")
+
+        submit_dict = await _run_submit_and_record(
+            cur_db=cur_db,
+            batch_id=batch_id,
+            items=target_batch["items"],
+            reviewer=reviewer,
+            target_url=req.target_url,
+        )
+        return {"batch_id": batch_id, "count": len(target_batch["items"]), "submit": submit_dict}
 
     # --- Review Gallery & Atomic Batch Export Endpoints ---
 
