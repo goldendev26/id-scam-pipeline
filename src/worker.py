@@ -11,16 +11,14 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from src.cert_collector import DEFAULT_MULTI_CT_LOGS, tail_multi_ct_logs
 from src.db import SupabaseDB, load_dotenv
 from src.discover import fetch_all_feeds
 from src.verify import SafeBrowserVerifier, extract_clean_text
 
-DEFAULT_DISCOVER_INTERVAL_S = 30.0
 DEFAULT_VERIFY_INTERVAL_S = 10.0
-DEFAULT_TRIAGE_INTERVAL_S = 15.0
 DEFAULT_VERIFY_BATCH = 10
 DEFAULT_VERIFY_CONCURRENCY = 4
 DEFAULT_TRIAGE_BATCH = 10

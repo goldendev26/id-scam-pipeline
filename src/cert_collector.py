@@ -30,7 +30,6 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence,
 from src.normalizer import normalize_url
 
 CRTSH_BASE_URL = "https://crt.sh/"
-CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 DEFAULT_CT_LOG_URL = os.getenv(
     "CT_LOG_URL", "https://ct.cloudflare.com/logs/nimbus2026"
 )

@@ -356,17 +356,28 @@ class TestAppAtomicExport(unittest.TestCase):
         db = _GalleryDB()
         client = TestClient(create_app(db=db))
 
-        # 1. GET / serves templates/index.html with A/N/X shortcuts, Auto strip, and gallery markup
+        # 1. GET / serves separated templates/index.html with static CSS/JS & security headers
         html = client.get("/")
         self.assertEqual(html.status_code, 200)
+        self.assertEqual(html.headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(html.headers.get("x-frame-options"), "DENY")
+        self.assertEqual(html.headers.get("referrer-policy"), "no-referrer")
         self.assertIn("Copy Next 20 Links", html.text)
         self.assertIn("Auto Pipeline", html.text)
         self.assertIn("Mulai Otomatis", html.text)
-        self.assertIn('data-theme="light"', html.text)
         self.assertIn('id="btnTheme"', html.text)
-        self.assertIn('key === "a"', html.text)
-        self.assertIn('key === "n"', html.text)
-        self.assertIn('key === "x"', html.text)
+        self.assertIn('href="/static/styles.css"', html.text)
+        self.assertIn('src="/static/app.js"', html.text)
+
+        css = client.get("/static/styles.css")
+        self.assertEqual(css.status_code, 200)
+        self.assertIn('data-theme="light"', css.text)
+
+        js = client.get("/static/app.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertIn('key === "a"', js.text)
+        self.assertIn('key === "n"', js.text)
+        self.assertIn('key === "x"', js.text)
 
         # 2. GET /api/review/queue returns signed URLs & live counts
         q = client.get("/api/review/queue")
@@ -563,8 +574,9 @@ class TestAppAtomicExport(unittest.TestCase):
         from src.mock_target import create_mock_app
         from src.submitter import SubmitResult, detect_gate_or_captcha, validate_submit_target_url
 
-        # 1. Mock portal accepts links & detects duplicates
+        # 1. Mock portal accepts links, exposes /health, & detects duplicates
         mock_client = TestClient(create_mock_app())
+        self.assertEqual(mock_client.get("/health").json(), {"status": "ok"})
         self.assertEqual(mock_client.get("/").status_code, 200)
         r1 = mock_client.post("/submit", content="reporter=tim1&links=https%3A%2F%2Fslot88.id%0Apinjol99.id", headers={"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(r1.status_code, 200)

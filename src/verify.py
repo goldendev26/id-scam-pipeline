@@ -594,23 +594,6 @@ def build_screenshot_path(normalized_url: str, url_id: Optional[int] = None) -> 
     return f"{url_id}_{name}" if url_id is not None else name
 
 
-def upload_verify_screenshot(
-    res: VerifyResult,
-    db: Any,
-    url_id: Optional[int] = None,
-    max_bytes: int = DEFAULT_MAX_SCREENSHOT_BYTES,
-) -> Optional[str]:
-    """Compress (<= 150 KB) and upload a VerifyResult screenshot to Supabase Storage."""
-    if not res.screenshot_bytes:
-        return None
-    jpeg = compress_jpeg_to_limit(res.screenshot_bytes, max_bytes=max_bytes)
-    storage_path = build_screenshot_path(
-        res.final_normalized_url or res.normalized_url or "page",
-        url_id=url_id,
-    )
-    return db.upload_screenshot(storage_path, jpeg)
-
-
 def save_debug_screenshot(res: VerifyResult, out_dir: Path) -> Optional[Path]:
     """Write JPEG bytes to disk for local debug inspection only."""
     if not res.screenshot_bytes:
