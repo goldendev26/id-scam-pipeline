@@ -1,17 +1,27 @@
 (() => {
   "use strict";
 
+  const PAGE_SIZE = 15;        // tarikan awal & ukuran refill
+  const REFILL_THRESHOLD = 6;  // refill saat sisa antrean <= 6
+  const PRELOAD_AHEAD = 3;     // preload screenshot 3 item berikutnya
+
   const state = {
     items: [],
     batches: [],
     lastExportBatchId: null,
     selectedIndex: -1,
-    filterMode: localStorage.getItem("gallery_filter") || "all",
-    busy: false,
     autoLoop: false,
     autoRunning: false,
     autoCycle: 0,
     autoTimer: null,
+    loading: true,
+    fetching: false,
+    exhausted: false,
+    epoch: 0,
+    lockTimer: null,
+    pending: new Map(),   // id -> item (keputusan optimistik yang belum dikonfirmasi API)
+    preloaded: new Set(),
+    preloadRefs: [],
   };
 
   const els = {
@@ -57,6 +67,7 @@
     inspAi: document.getElementById("inspAi"),
     inspLock: document.getElementById("inspLock"),
     inspSnippet: document.getElementById("inspSnippet"),
+    inspSkel: document.getElementById("inspectorSkeleton"),
     noteInput: document.getElementById("noteInput"),
     noteCounter: document.getElementById("noteCounter"),
     exportModal: document.getElementById("exportModal"),
@@ -138,7 +149,7 @@
         await navigator.clipboard.writeText(text);
         return true;
       }
-    } catch (_) {}
+    } catch (_) { }
     const ta = document.createElement("textarea");
     ta.value = text;
     ta.style.position = "fixed";
@@ -550,61 +561,90 @@
     }
   }
 
-  function renderGallery() {
-    syncFilterUi();
-    const list = visibleItems();
-    if (!list.length) {
-      const msg = state.items.length
-        ? `Semua ${state.items.length} situs saat ini berkategori benign. Klik <strong>Semua</strong> untuk menampilkannya.`
-        : `Antrean review kosong. Jalankan <strong>Auto Pipeline</strong> atau <strong>Browser Capture</strong> di atas.`;
-      els.gallery.innerHTML = `<div class="empty-state">${msg}</div>`;
-      renderInspector();
+  function bumpCount(el, delta) {
+    el.textContent = String(Math.max(0, (Number(el.textContent) || 0) + delta));
+  }
+
+  function skeletonCards(n) {
+    return Array.from({ length: n }, () => `
+      <article class="card skeleton-card" aria-hidden="true">
+        <div class="thumb-wrap skel"></div>
+        <div class="card-body">
+          <div class="skel skel-line w70"></div>
+          <div class="skel skel-line w40"></div>
+          <div class="skel skel-line w90"></div>
+        </div>
+      </article>`).join("");
+  }
+
+  function cardHtml(item, idx, me) {
+    const active = idx === state.selectedIndex ? "active" : "";
+    const lockedOther = item.locked_by && item.locked_by !== me ? "locked-other" : "";
+    const cat = item.ai_category || "unsure";
+    const confPct = item.ai_confidence != null ? Math.round(Number(item.ai_confidence) * 100) : 0;
+    const shot = item.screenshot_url
+      ? `<img src="${escapeHtml(item.screenshot_url)}" alt="${escapeHtml(item.normalized_url)}" loading="lazy" decoding="async" />`
+      : `<span class="no-shot">Tanpa screenshot</span>`;
+    const lockBadge = item.locked_by
+      ? `<span class="tag lock-tag">@${escapeHtml(item.locked_by)}</span>`
+      : "";
+    return `
+      <article class="card ${active} ${lockedOther}" data-idx="${idx}">
+        <div class="thumb-wrap">
+          ${shot}
+          <div class="thumb-overlay">
+            <span class="tag ${categoryClass(cat)}"><span class="tag-dot"></span>${escapeHtml(cat)} <span class="tabular">${formatConfidence(item.ai_confidence)}</span></span>
+            ${lockBadge}
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="url-text">${escapeHtml(item.normalized_url)}</div>
+          <div class="title-text">${escapeHtml(item.page_title || "Tanpa judul")}</div>
+          <div class="conf-track"><div class="conf-fill" style="width:${Math.min(100, Math.max(0, confPct))}%"></div></div>
+          <div class="ai-note">${escapeHtml(item.ai_note || "Belum ada catatan AI")}</div>
+          <div class="card-actions">
+            <button type="button" data-act="approve" data-idx="${idx}"><span class="kbd">A</span>OK</button>
+            <button type="button" data-act="approve_note" data-idx="${idx}"><span class="kbd">N</span>Note</button>
+            <button type="button" data-act="skip" data-idx="${idx}"><span class="kbd">X</span>Skip</button>
+          </div>
+        </div>
+      </article>`;
+  }
+
+  function renderGallery(withInspector = true) {
+    if (state.loading || (!state.items.length && state.fetching)) {
+      els.gallery.innerHTML = skeletonCards(6);
+      if (withInspector) renderInspector();
       return;
     }
-
+    if (!state.items.length) {
+      els.gallery.innerHTML = `<div class="empty-state">Antrean review kosong. Jalankan <strong>Auto Pipeline</strong> atau <strong>Browser Capture</strong> di atas.</div>`;
+      if (withInspector) renderInspector();
+      return;
+    }
     const me = getReviewer();
-    els.gallery.innerHTML = list.map((item, idx) => {
-      const active = idx === state.selectedIndex ? "active" : "";
-      const lockedOther = item.locked_by && item.locked_by !== me ? "locked-other" : "";
-      const cat = item.ai_category || "unsure";
-      const confPct = item.ai_confidence != null ? Math.round(Number(item.ai_confidence) * 100) : 0;
-      const shot = item.screenshot_url
-        ? `<img src="${escapeHtml(item.screenshot_url)}" alt="${escapeHtml(item.normalized_url)}" loading="lazy" />`
-        : `<span class="no-shot">Tanpa screenshot</span>`;
-      const lockBadge = item.locked_by
-        ? `<span class="tag lock-tag">@${escapeHtml(item.locked_by)}</span>`
-        : "";
-
-      return `
-        <article class="card ${active} ${lockedOther}" data-idx="${idx}">
-          <div class="thumb-wrap">
-            ${shot}
-            <div class="thumb-overlay">
-              <span class="tag ${categoryClass(cat)}"><span class="tag-dot"></span>${escapeHtml(cat)} <span class="tabular">${formatConfidence(item.ai_confidence)}</span></span>
-              ${lockBadge}
-            </div>
-          </div>
-          <div class="card-body">
-            <div class="url-text">${escapeHtml(item.normalized_url)}</div>
-            <div class="title-text">${escapeHtml(item.page_title || "Tanpa judul")}</div>
-            <div class="conf-track"><div class="conf-fill" style="width:${Math.min(100, Math.max(0, confPct))}%"></div></div>
-            <div class="ai-note">${escapeHtml(item.ai_note || "Belum ada catatan AI")}</div>
-            <div class="card-actions">
-              <button type="button" data-act="approve" data-idx="${idx}"><span class="kbd">A</span>OK</button>
-              <button type="button" data-act="approve_note" data-idx="${idx}"><span class="kbd">N</span>Note</button>
-              <button type="button" data-act="skip" data-idx="${idx}"><span class="kbd">X</span>Skip</button>
-            </div>
-          </div>
-        </article>
-      `;
-    }).join("");
-
+    els.gallery.innerHTML = state.items.map((item, idx) => cardHtml(item, idx, me)).join("");
     const activeEl = els.gallery.querySelector(".card.active");
     if (activeEl) activeEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    renderInspector();
+    if (withInspector) renderInspector();
+  }
+
+  function highlightActive() {
+    els.gallery.querySelectorAll(".card.active").forEach((c) => c.classList.remove("active"));
+    const el = els.gallery.querySelector(`.card[data-idx="${state.selectedIndex}"]`);
+    if (el) {
+      el.classList.add("active");
+      el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
   }
 
   function renderInspector() {
+    els.inspSkel.style.display = state.loading ? "flex" : "none";
+    if (state.loading) {
+      els.inspEmpty.style.display = "none";
+      els.inspContent.style.display = "none";
+      return;
+    }
     const item = currentItem();
     if (!item) {
       els.inspEmpty.style.display = "block";
@@ -613,19 +653,20 @@
     }
     els.inspEmpty.style.display = "none";
     els.inspContent.style.display = "flex";
-
     if (item.screenshot_url) {
-      els.inspImg.src = item.screenshot_url;
+      if (els.inspImg.getAttribute("src") !== item.screenshot_url) {
+        els.inspImg.decoding = "async";
+        els.inspImg.src = item.screenshot_url;
+      }
       els.inspImg.style.display = "block";
     } else {
       els.inspImg.removeAttribute("src");
       els.inspImg.style.display = "none";
     }
-
-    els.inspIdStatus.textContent = `#${item.id} · ${item.status} · HTTP ${item.http_status ?? "-"}`;
-    els.inspUrl.textContent = item.normalized_url || "-";
-    els.inspFinalUrl.textContent = item.final_normalized_url || item.normalized_url || "-";
-    els.inspTitle.textContent = item.page_title || "-";
+    els.inspIdStatus.textContent = `#${item.id} · ${item.status} · HTTP ${item.http_status ?? "—"}`;
+    els.inspUrl.textContent = item.normalized_url || "—";
+    els.inspFinalUrl.textContent = item.final_normalized_url || item.normalized_url || "—";
+    els.inspTitle.textContent = item.page_title || "—";
     els.inspAi.innerHTML = `<span class="tag ${categoryClass(item.ai_category)}"><span class="tag-dot"></span>${escapeHtml(item.ai_category || "unsure")} ${formatConfidence(item.ai_confidence)}</span>`;
     els.inspLock.textContent = item.locked_by ? `@${item.locked_by}` : "Terbuka";
     els.noteInput.value = (item.ai_note || "").slice(0, 140);
@@ -633,88 +674,188 @@
     els.inspSnippet.textContent = item.clean_text || "(Tidak ada teks terekstrak)";
   }
 
-  async function lockCard(idx) {
-    const list = visibleItems();
-    const item = list[idx];
-    if (!item) return;
-    try {
-      const { res, data } = await postJson("/api/review/lock", {
-        reviewer: getReviewer(),
-        url_id: item.id,
-      });
-      if (res.status === 409) {
-        showToast(`#${item.id} sedang dikunci reviewer lain.`);
-        return;
-      }
-      if (res.ok && data.locked) {
-        const masterIdx = state.items.findIndex((r) => r.id === item.id);
-        if (masterIdx !== -1) state.items[masterIdx] = { ...item, ...data.locked };
-        renderGallery();
-      }
-    } catch (err) {
-      console.warn("Lock failed:", err);
+  /* --- Image preloading: screenshot 2-3 item berikutnya diunduh di latar belakang --- */
+  function preloadAhead() {
+    for (let i = 0; i <= PRELOAD_AHEAD; i++) {
+      const it = state.items[state.selectedIndex + i];
+      if (!it || !it.screenshot_url || state.preloaded.has(it.screenshot_url)) continue;
+      state.preloaded.add(it.screenshot_url);
+      const img = new Image();
+      img.decoding = "async";
+      img.src = it.screenshot_url;
+      state.preloadRefs.push(img);
+      if (state.preloadRefs.length > 16) state.preloadRefs.shift();
     }
   }
 
-  async function selectIndex(idx, shouldLock = true) {
-    const list = visibleItems();
-    if (!list.length) {
+  /* --- Lock: non-blocking & di-debounce, tidak me-render ulang UI --- */
+  function scheduleLock(itemId) {
+    clearTimeout(state.lockTimer);
+    state.lockTimer = setTimeout(() => lockItem(itemId), 150);
+  }
+
+  function lockItem(itemId) {
+    fetch("/api/review/lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer: getReviewer(), url_id: itemId }),
+    }).then(async (res) => {
+      if (res.status === 409) {
+        const cur = currentItem();
+        if (cur && cur.id === itemId) showToast(`#${itemId} sedang dikunci reviewer lain.`);
+        return;
+      }
+      if (!res.ok) return;
+      const data = await res.json();
+      const target = state.items.find((i) => i.id === itemId);
+      if (target && data.locked) {
+        target.locked_by = data.locked.locked_by;
+        target.locked_at = data.locked.locked_at;
+        const cur = currentItem();
+        if (cur && cur.id === itemId) els.inspLock.textContent = `@${target.locked_by}`;
+      }
+    }).catch((err) => console.warn("Lock failed:", err));
+  }
+
+  function selectIndex(idx, shouldLock = true) {
+    if (!state.items.length) {
       state.selectedIndex = -1;
       renderGallery();
       return;
     }
-    state.selectedIndex = Math.max(0, Math.min(idx, list.length - 1));
-    renderGallery();
-    if (shouldLock) await lockCard(state.selectedIndex);
+    state.selectedIndex = Math.max(0, Math.min(idx, state.items.length - 1));
+    highlightActive();
+    renderInspector();
+    preloadAhead();
+    maybeRefill();
+    if (shouldLock) scheduleLock(currentItem().id);
   }
 
+  /* --- Progressive fetch: tarikan awal kecil, refill otomatis saat sisa menipis --- */
   async function loadQueue() {
+    const epoch = ++state.epoch;
+    state.loading = state.items.length === 0;
+    if (state.loading) renderGallery();
     try {
-      const res = await fetch("/api/review/queue?limit=40");
+      const res = await fetch(`/api/review/queue?limit=${PAGE_SIZE}`);
       if (res.status === 404 || res.status === 405) {
         throw new Error("Backend FastAPI belum aktif. Jalankan `docker compose up dashboard` lalu buka http://127.0.0.1:8000 (jangan pakai Live Server).");
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      state.items = data.items || [];
+      if (epoch !== state.epoch) return;
+      const fetched = data.items || [];
+      state.items = fetched.filter((i) => !state.pending.has(i.id));
+      state.exhausted = fetched.length < PAGE_SIZE;
+      state.loading = false;
+      state.selectedIndex = state.items.length ? 0 : -1;
       renderCounts(data.counts);
-      const list = visibleItems();
-      await selectIndex(list.length ? 0 : -1, list.length > 0);
+      renderGallery();
+      if (state.items.length) {
+        preloadAhead();
+        scheduleLock(state.items[0].id);
+      }
+      maybeRefill();
     } catch (err) {
+      if (epoch !== state.epoch) return;
+      state.loading = false;
+      renderGallery();
       showToast(`Gagal memuat antrean: ${err.message}`);
     }
   }
 
-  async function submitDecision(action, customNote = null) {
-    const item = currentItem();
-    if (!item || state.busy) return;
-    state.busy = true;
+  async function maybeRefill() {
+    if (state.loading || state.fetching || state.exhausted) return;
+    if (state.items.length > REFILL_THRESHOLD) return;
+    const epoch = state.epoch;
+    const heldIds = [...state.items.map((i) => i.id), ...state.pending.keys()];
+    const exclude = heldIds.slice(-150).join(",");
+    state.fetching = true;
+    if (!state.items.length) renderGallery(false);
     try {
-      const payload = { reviewer: getReviewer(), action };
-      if (action === "approve_note") {
-        payload.note = (customNote !== null ? customNote : els.noteInput.value).trim().slice(0, 140);
+      const res = await fetch(
+        `/api/review/queue?limit=${PAGE_SIZE}&counts=false&exclude=${encodeURIComponent(exclude)}`
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (epoch !== state.epoch) return;
+      const fetched = data.items || [];
+      const known = new Set(state.items.map((i) => i.id));
+      const fresh = fetched.filter((i) => !known.has(i.id) && !state.pending.has(i.id));
+      state.exhausted = fetched.length < PAGE_SIZE;
+      if (fresh.length) {
+        const startIdx = state.items.length;
+        state.items.push(...fresh);
+        if (startIdx === 0) {
+          state.selectedIndex = 0;
+          renderGallery();
+          scheduleLock(state.items[0].id);
+        } else {
+          const me = getReviewer();
+          els.gallery.insertAdjacentHTML(
+            "beforeend",
+            fresh.map((item, k) => cardHtml(item, startIdx + k, me)).join("")
+          );
+        }
+        preloadAhead();
+      } else if (!state.items.length) {
+        renderGallery();
       }
-      const { res, data } = await postJson(`/api/review/${item.id}/decide`, payload);
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-      const label = action === "skip" ? "Skipped" : (action === "approve_note" ? "Approved + Note" : "Approved");
-      showToast(`${label}: ${item.normalized_url}`);
-
-      const masterIdx = state.items.findIndex((r) => r.id === item.id);
-      if (masterIdx !== -1) state.items.splice(masterIdx, 1);
-      els.cntQueue.textContent = String(Math.max(0, Number(els.cntQueue.textContent) - 1));
-      if (action === "skip") {
-        els.cntSkipped.textContent = String(Number(els.cntSkipped.textContent) + 1);
-      } else {
-        els.cntApproved.textContent = String(Number(els.cntApproved.textContent) + 1);
-      }
-      els.noteInput.blur();
-      const nextList = visibleItems();
-      await selectIndex(Math.min(state.selectedIndex, nextList.length - 1), nextList.length > 0);
     } catch (err) {
-      showToast(`Gagal menyimpan: ${err.message}`);
+      console.warn("Refill gagal:", err);
+      if (!state.items.length) renderGallery();
     } finally {
-      state.busy = false;
+      state.fetching = false;
     }
+  }
+
+  /* --- Optimistic UI: pindah item seketika, API jalan di latar belakang --- */
+  function submitDecision(action, customNote = null) {
+    const item = currentItem();
+    if (!item || state.pending.has(item.id)) return;
+    const payload = { reviewer: getReviewer(), action };
+    if (action === "approve_note") {
+      payload.note = (customNote !== null ? customNote : els.noteInput.value).trim().slice(0, 140);
+    }
+    const idx = state.selectedIndex;
+    const countEl = action === "skip" ? els.cntSkipped : els.cntApproved;
+    const label = action === "skip" ? "Skipped" : (action === "approve_note" ? "Approved + Note" : "Approved");
+    state.pending.set(item.id, item);
+    state.items.splice(idx, 1);
+    bumpCount(els.cntQueue, -1);
+    bumpCount(countEl, 1);
+    showToast(`${label}: ${item.normalized_url}`);
+    els.noteInput.blur();
+    state.selectedIndex = state.items.length ? Math.min(idx, state.items.length - 1) : -1;
+    renderGallery();
+    const next = currentItem();
+    if (next) {
+      preloadAhead();
+      scheduleLock(next.id);
+    }
+    maybeRefill();
+    fetch(`/api/review/${item.id}/decide`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(async (res) => {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      state.pending.delete(item.id);
+    }).catch((err) => {
+      state.pending.delete(item.id);
+      // Rollback: kembalikan item ke posisi semula & koreksi counter.
+      const at = Math.min(idx, state.items.length);
+      state.items.splice(at, 0, item);
+      bumpCount(els.cntQueue, 1);
+      bumpCount(countEl, -1);
+      state.selectedIndex = at;
+      renderGallery();
+      preloadAhead();
+      showToast(`Gagal menyimpan ${item.normalized_url}: ${err.message}. Item dikembalikan ke antrean.`);
+    });
   }
 
   /* Export & Auto-Submit */
