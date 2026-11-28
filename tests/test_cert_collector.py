@@ -1,4 +1,4 @@
-"""Unit tests for src.cert_collector (FR-DISC-001, Task #17)."""
+"""Unit tests for src.cert_collector"""
 
 import base64
 from datetime import datetime, timedelta, timezone

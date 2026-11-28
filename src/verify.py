@@ -1,9 +1,9 @@
-"""Sandboxed Playwright browser verifier (FR-VERIF-001, Task #12).
+"""Sandboxed Playwright browser verifier.
 
 Opens candidate URLs inside an isolated headless Chromium context with downloads
 disabled, follows HTTP/JS redirects, normalizes the final landing URL using
 `src.normalizer`, and returns HTML + JPEG screenshot bytes for downstream text
-parsing (Task #13) and Supabase Storage upload (Task #14).
+parsing and Supabase Storage upload.
 """
 
 from __future__ import annotations

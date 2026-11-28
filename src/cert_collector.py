@@ -1,4 +1,4 @@
-"""Passive SSL Certificate Transparency collector (FR-DISC-001, Task #17).
+"""Passive SSL Certificate Transparency collector.
 
 Watches public Certificate Transparency logs to catch freshly issued Indonesian
 online gambling (judol), unlicensed loan (pinjol), and bank/gov phishing domains:

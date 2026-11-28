@@ -1,4 +1,4 @@
-"""Passive DNS pivoter and sibling mirror expander (FR-PIVOT-001, Task #33).
+"""Passive DNS pivoter and sibling mirror expander.
 
 Takes confirmed illegal domains and uses passive public DNS queries (`dnspython`)
 to fingerprint infrastructure (A, AAAA, NS, CNAME, MX), cluster domains operated
