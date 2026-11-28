@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import unittest
 
 from src.cert_collector import CertCandidate
-from src.worker import run_discover_pass, run_triage_pass, run_verify_pass
+from src.worker import (
+    run_discover_pass,
+    run_reverify_approved_pass,
+    run_triage_pass,
+    run_verify_pass,
+)
 from tests.test_verify import _FakeBrowser, _FakePlaywrightCM
 
 
@@ -150,6 +155,67 @@ class TestAutomatedWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.rows[0]["status"], "triaged")
         self.assertEqual(db.rows[0]["ai_category"], "judol")
         self.assertEqual(db.rows[0]["ai_confidence"], 0.95)
+
+    async def test_reverify_approved_keeps_live_and_prunes_dead_or_blocked(self):
+        from src.verify import SafeBrowserVerifier
+
+        db = _MemoryWorkerDB()
+        db.rows = [
+            {
+                "id": 1,
+                "raw_url": "https://masihhidup88.xyz",
+                "normalized_url": "masihhidup88.xyz",
+                "final_normalized_url": "masihhidup88.xyz",
+                "status": "approved",
+                "batch_id": None,
+            },
+            {
+                "id": 2,
+                "raw_url": "https://kenablokir99.xyz",
+                "normalized_url": "kenablokir99.xyz",
+                "final_normalized_url": "kenablokir99.xyz",
+                "status": "approved",
+                "batch_id": None,
+            },
+        ]
+
+        def fake_page(url: str) -> dict:
+            if "masihhidup88" in url:
+                return {
+                    "final_url": "https://masihhidup88.xyz/promo",
+                    "status": 200,
+                    "title": "Slot Masih Hidup",
+                    "html": "<html><body><h1>Slot Masih Hidup</h1><p>Deposit QRIS</p></body></html>",
+                    "screenshot": b"\xff\xd8\xffdemo",
+                }
+            return {
+                "final_url": "https://trustpositif.komdigi.go.id/blocked",
+                "status": 200,
+                "title": "Internet Positif",
+                "html": "<html><body>Situs ini diblokir oleh Komdigi Trust+</body></html>",
+                "screenshot": b"\xff\xd8\xffdemo",
+            }
+
+        browser = _FakeBrowser(fake_page)
+        summary = await run_reverify_approved_pass(
+            db,
+            verifier_factory=lambda: SafeBrowserVerifier(
+                uploader=db.upload_screenshot,
+                playwright_factory=lambda: _FakePlaywrightCM(browser),
+            ),
+        )
+        self.assertEqual(
+            summary,
+            {
+                "stage": "reverify_approved",
+                "processed": 2,
+                "still_approved": 1,
+                "dead_or_blocked": 1,
+            },
+        )
+        self.assertEqual(db.rows[0]["status"], "approved")
+        self.assertEqual(db.rows[0]["final_normalized_url"], "masihhidup88.xyz/promo")
+        self.assertEqual(db.rows[1]["status"], "dead_or_blocked")
 
 
 if __name__ == "__main__":

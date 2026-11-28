@@ -79,7 +79,7 @@ class CollectRequest(BaseModel):
 
 
 class VerifyQueueRequest(BaseModel):
-    limit: int = Field(default=5, ge=1, le=30)
+    limit: int = Field(default=5, ge=1, le=100)
     concurrency: int = Field(default=3, ge=1, le=6)
     timeout_ms: int = Field(default=15000, ge=3000, le=45000)
 
@@ -116,6 +116,15 @@ def _attach_signed_url(db: Any, row: dict[str, Any]) -> dict[str, Any]:
     else:
         item.setdefault("screenshot_url", None)
     return item
+
+
+def _compute_asset_version() -> str:
+    mtimes = []
+    for name in ("styles.css", "app.js"):
+        p = STATIC_DIR / name
+        if p.is_file():
+            mtimes.append(str(int(p.stat().st_mtime)))
+    return "-".join(mtimes) or "1"
 
 
 def create_app(
@@ -171,6 +180,7 @@ def create_app(
                 "default_reviewer": default_reviewer,
                 "submit_target_url": raw_target,
                 "portal_browser_url": portal_browser_url,
+                "asset_version": _compute_asset_version(),
             },
         )
 
@@ -309,6 +319,21 @@ def create_app(
             "dead_or_blocked": dead_cnt,
             "items": results,
         }
+
+    @app.post("/api/pipeline/reverify-approved")
+    async def pipeline_reverify_approved(payload: Optional[VerifyQueueRequest] = None) -> dict[str, Any]:
+        """Cek ulang link status='approved' terlama sebelum hari-H; yang mati/Trust+ otomatis pindah ke dead_or_blocked."""
+        from src.worker import run_reverify_approved_pass
+
+        req = payload or VerifyQueueRequest(limit=10, concurrency=4, timeout_ms=9000)
+        cur_db = get_db()
+        return await run_reverify_approved_pass(
+            cur_db,
+            batch_size=req.limit,
+            concurrency=req.concurrency,
+            timeout_ms=req.timeout_ms,
+            verifier_factory=verifier_factory,
+        )
 
     @app.post("/api/pipeline/triage/export-prompts")
     def pipeline_triage_export_prompts(payload: Optional[TriagePromptRequest] = None) -> dict[str, Any]:

@@ -131,6 +131,88 @@ async def run_verify_pass(
     }
 
 
+async def run_reverify_approved_pass(
+    db: Any,
+    *,
+    batch_size: int = 10,
+    concurrency: int = DEFAULT_VERIFY_CONCURRENCY,
+    timeout_ms: int = 9000,
+    verifier_factory: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """Re-check oldest-updated status='approved' URLs; prune dead/Trust+ sites automatically."""
+    def _fetch_oldest_approved() -> Any:
+        try:
+            return db.fetch_queue("approved", batch_size, order="updated_at.asc,id.asc")
+        except TypeError:
+            return db.fetch_queue("approved", batch_size)
+
+    rows = await asyncio.to_thread(_fetch_oldest_approved)
+    queue = [r for r in rows if r.get("batch_id") is None]
+    if not queue:
+        return {
+            "stage": "reverify_approved",
+            "processed": 0,
+            "still_approved": 0,
+            "dead_or_blocked": 0,
+        }
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    make_verifier = verifier_factory or (
+        lambda: SafeBrowserVerifier(
+            timeout_ms=timeout_ms,
+            uploader=db.upload_screenshot,
+        )
+    )
+
+    async def _one(verifier: Any, row: Dict[str, Any]) -> str:
+        async with sem:
+            target = (
+                row.get("final_url")
+                or row.get("final_normalized_url")
+                or row.get("raw_url")
+                or row.get("normalized_url")
+                or ""
+            )
+            res = await verifier.verify_url(target, url_id=row["id"])
+            if res.status == "verified":
+                fields: Dict[str, Any] = {
+                    "final_url": res.final_url,
+                    "final_normalized_url": res.final_normalized_url,
+                    "http_status": res.http_status,
+                    "error_code": None,
+                    "error_detail": None,
+                }
+                if res.page_title:
+                    fields["page_title"] = res.page_title
+                if res.raw_html:
+                    fields["clean_text"] = extract_clean_text(res.raw_html)
+                if res.screenshot_path:
+                    fields["screenshot_path"] = res.screenshot_path
+                await asyncio.to_thread(db.update_status, row["id"], "approved", **fields)
+                return "approved"
+
+            await asyncio.to_thread(
+                db.update_status,
+                row["id"],
+                "dead_or_blocked",
+                http_status=res.http_status,
+                error_code=res.error_code,
+                error_detail=res.error_detail,
+            )
+            return "dead_or_blocked"
+
+    async with make_verifier() as verifier:
+        statuses = list(await asyncio.gather(*(_one(verifier, row) for row in queue)))
+
+    still_approved = sum(1 for st in statuses if st == "approved")
+    return {
+        "stage": "reverify_approved",
+        "processed": len(statuses),
+        "still_approved": still_approved,
+        "dead_or_blocked": len(statuses) - still_approved,
+    }
+
+
 async def run_triage_pass(
     db: Any,
     *,
@@ -195,6 +277,15 @@ async def _loop(
     collect_duration: float,
 ) -> int:
     with SupabaseDB.from_env() as db:
+        if mode == "reverify":
+            summary = await run_reverify_approved_pass(
+                db,
+                batch_size=max(verify_batch, 50),
+                concurrency=verify_concurrency,
+            )
+            print(json.dumps(summary), flush=True)
+            return 0
+
         cycle = 0
         while True:
             cycle += 1
@@ -250,10 +341,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "mode",
-        choices=("discover", "verify", "triage", "all"),
+        choices=("discover", "verify", "triage", "reverify", "all"),
         default="all",
         nargs="?",
-        help="Pipeline stages to run (default: all).",
+        help="Pipeline stages to run (default: all; use 'reverify' to re-check approved links).",
     )
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
     parser.add_argument("--backfill", type=int, default=2000, help="CT backfill per log (default: 2000).")
