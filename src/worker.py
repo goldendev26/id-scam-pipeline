@@ -100,9 +100,24 @@ async def run_verify_pass(
         )
     )
 
+    per_url_hard_timeout = max(25.0, (timeout_ms / 1000.0) * 2.2)
+
     async def _one(verifier: Any, row: Dict[str, Any]) -> str:
         async with sem:
-            res = await verifier.verify_url(row["raw_url"], url_id=row["id"])
+            try:
+                res = await asyncio.wait_for(
+                    verifier.verify_url(row["raw_url"], url_id=row["id"]),
+                    timeout=per_url_hard_timeout,
+                )
+            except asyncio.TimeoutError:
+                await asyncio.to_thread(
+                    db.update_status,
+                    row["id"],
+                    "dead_or_blocked",
+                    error_code="ERR_TARGET_TIMEOUT",
+                    error_detail=f"Hard timeout after {int(per_url_hard_timeout)}s",
+                )
+                return "dead_or_blocked"
             clean_txt = extract_clean_text(res.raw_html or "") if res.raw_html else None
             await asyncio.to_thread(
                 db.update_status,
@@ -164,6 +179,8 @@ async def run_reverify_approved_pass(
         )
     )
 
+    per_url_hard_timeout = max(20.0, (timeout_ms / 1000.0) * 2.2)
+
     async def _one(verifier: Any, row: Dict[str, Any]) -> str:
         async with sem:
             target = (
@@ -173,7 +190,20 @@ async def run_reverify_approved_pass(
                 or row.get("normalized_url")
                 or ""
             )
-            res = await verifier.verify_url(target, url_id=row["id"])
+            try:
+                res = await asyncio.wait_for(
+                    verifier.verify_url(target, url_id=row["id"]),
+                    timeout=per_url_hard_timeout,
+                )
+            except asyncio.TimeoutError:
+                await asyncio.to_thread(
+                    db.update_status,
+                    row["id"],
+                    "dead_or_blocked",
+                    error_code="ERR_TARGET_TIMEOUT",
+                    error_detail=f"Hard timeout after {int(per_url_hard_timeout)}s",
+                )
+                return "dead_or_blocked"
             if res.status == "verified":
                 fields: Dict[str, Any] = {
                     "final_url": res.final_url,
@@ -291,11 +321,14 @@ async def _loop(
             cycle += 1
             if mode in ("discover", "all"):
                 try:
-                    summary = await run_discover_pass(
-                        db,
-                        backfill=backfill if cycle == 1 else min(backfill, 1500),
-                        duration_s=collect_duration,
-                        include_feeds=(cycle == 1 or cycle % 10 == 0),
+                    summary = await asyncio.wait_for(
+                        run_discover_pass(
+                            db,
+                            backfill=backfill if cycle == 1 else min(backfill, 1500),
+                            duration_s=collect_duration,
+                            include_feeds=(cycle == 1 or cycle % 10 == 0),
+                        ),
+                        timeout=90.0,
                     )
                     print(json.dumps({"cycle": cycle, **summary}), flush=True)
                 except Exception as exc:
@@ -303,10 +336,13 @@ async def _loop(
 
             if mode in ("verify", "all"):
                 try:
-                    summary = await run_verify_pass(
-                        db,
-                        batch_size=verify_batch,
-                        concurrency=verify_concurrency,
+                    summary = await asyncio.wait_for(
+                        run_verify_pass(
+                            db,
+                            batch_size=verify_batch,
+                            concurrency=verify_concurrency,
+                        ),
+                        timeout=120.0,
                     )
                     print(json.dumps({"cycle": cycle, **summary}), flush=True)
                 except Exception as exc:
@@ -314,7 +350,10 @@ async def _loop(
 
             if mode in ("triage", "all"):
                 try:
-                    summary = await run_triage_pass(db)
+                    summary = await asyncio.wait_for(
+                        run_triage_pass(db),
+                        timeout=90.0,
+                    )
                     print(json.dumps({"cycle": cycle, **summary}), flush=True)
                 except Exception as exc:
                     print(f"[worker:triage] error: {exc}", file=sys.stderr, flush=True)

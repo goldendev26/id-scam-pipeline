@@ -48,6 +48,9 @@ CREATE INDEX IF NOT EXISTS idx_urls_export_ready
 CREATE INDEX IF NOT EXISTS idx_urls_locked_by
     ON urls (locked_by)
     WHERE locked_by IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_urls_review_queue
+    ON urls (ai_confidence DESC NULLS LAST, id ASC)
+    WHERE status IN ('ai_scored', 'triaged', 'verified');
 
 -- Aktifkan RLS agar tabel di schema public tidak terbuka ke anon/authenticated secara default
 -- (backend pipeline mengakses lewat service_role yang otomatis bypass RLS).
@@ -172,8 +175,22 @@ BEGIN
 END;
 $$;
 
+-- Hitung jumlah URL per status langsung di PostgreSQL (GROUP BY), menghindari limit 1000 baris PostgREST.
+CREATE OR REPLACE FUNCTION public.status_counts()
+RETURNS TABLE (status TEXT, total BIGINT)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $$
+    SELECT u.status, COUNT(*) FROM public.urls u GROUP BY u.status;
+$$;
+
 REVOKE ALL ON FUNCTION public.claim_url_for_review(TEXT, BIGINT, TEXT[], INTEGER) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.claim_url_for_review(TEXT, BIGINT, TEXT[], INTEGER) TO service_role;
 
 REVOKE ALL ON FUNCTION public.export_next_batch(TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.export_next_batch(TEXT, INTEGER) TO service_role;
+
+REVOKE ALL ON FUNCTION public.status_counts() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.status_counts() TO service_role;

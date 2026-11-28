@@ -169,15 +169,28 @@ class SupabaseDB:
         return resp.json()
 
     def get_status_counts(self) -> dict[str, int]:
-        """Hitung jumlah baris per status untuk ringkasan dashboard."""
-        # ponytail: single select=status scan; ganti ke SQL GROUP BY RPC jika >50k baris.
+        """Hitung jumlah baris per status via SQL GROUP BY RPC (fallback ke scan jika RPC belum ada)."""
+        rpc_resp = self._client.post(
+            f"{self.base_url}/rest/v1/rpc/status_counts",
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={},
+        )
+        if rpc_resp.status_code == 200:
+            counts: dict[str, int] = {}
+            for row in rpc_resp.json():
+                st = str(row.get("status") or "unknown")
+                counts[st] = int(row.get("total") or 0)
+            return counts
+        if rpc_resp.status_code != 404:
+            rpc_resp.raise_for_status()
+
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
             params={"select": "status"},
             headers=self._headers(),
         )
         resp.raise_for_status()
-        counts: dict[str, int] = {}
+        counts = {}
         for row in resp.json():
             st = str(row.get("status") or "unknown")
             counts[st] = counts.get(st, 0) + 1
