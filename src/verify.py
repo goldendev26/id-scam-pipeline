@@ -19,6 +19,9 @@ import time
 from typing import Any, Callable, Iterable, List, Optional, Sequence
 from urllib.parse import urlsplit
 
+from bs4 import BeautifulSoup
+
+from src.config import ERR_HTTP_ERROR, PAGE_TEXT_MAX_CHARS, STATUS_DEAD_OR_BLOCKED, STATUS_VERIFIED
 from src.normalizer import normalize_url
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("VERIFY_TIMEOUT_MS", "15000"))
@@ -119,6 +122,162 @@ def _is_timeout_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "timeout" in name or "timed out" in msg or "err_timed_out" in msg
 
+
+REASON_TRUST_POSITIF = "trust_positif"
+REASON_PARKED = "parked"
+REASON_SUSPENDED = "suspended_or_expired"
+REASON_HTTP_ERROR = "http_error"
+
+_MAX_PARSE_CHARS = 500_000
+_SHORT_PAGE_CHARS = 1500
+_STRIPPED_TAGS = ["script", "style", "noscript", "template", "svg", "canvas", "iframe", "head"]
+_INVISIBLE_CHARS = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+_TRUST_POSITIF_HOSTS = (
+    "internetpositif.id",
+    "trustpositif.kominfo.go.id",
+    "trustpositif.komdigi.go.id",
+)
+_TRUST_POSITIF_MARKERS = (
+    "internet positif",
+    "internetpositif",
+    "trust positif",
+    "trustpositif",
+    "trust+",
+    "situs ini diblokir",
+    "situs ini telah diblokir",
+    "website ini diblokir",
+    "laman ini diblokir",
+    "diblokir oleh komdigi",
+    "diblokir oleh kominfo",
+    "diblokir oleh pemerintah",
+    "blocked by komdigi",
+    "blocked by kominfo",
+)
+
+_PARKING_HOSTS = (
+    "sedoparking.com",
+    "sedo.com",
+    "parkingcrew.net",
+    "bodis.com",
+    "dan.com",
+    "afternic.com",
+    "hugedomains.com",
+)
+_PARKED_MARKERS = (
+    "this domain is for sale",
+    "this domain may be for sale",
+    "domain is for sale",
+    "buy this domain",
+    "domain for sale",
+    "domain ini dijual",
+    "domain ini sedang dijual",
+    "domain dijual",
+    "domain parking",
+    "parked domain",
+    "this domain is parked",
+    "domain ini diparkir",
+    "welcome to nginx",
+    "apache2 ubuntu default page",
+    "apache2 debian default page",
+    "test page for the apache",
+    "domain default page",
+)
+
+_SUSPENDED_MARKERS = (
+    "account suspended",
+    "this account has been suspended",
+    "bandwidth limit exceeded",
+    "domain has expired",
+    "this domain has expired",
+    "domain expired",
+)
+
+
+@dataclass(frozen=True)
+class PageAssessment:
+    status: str
+    reason: Optional[str] = None
+    error_code: Optional[str] = None
+    detail: Optional[str] = None
+
+    @property
+    def is_dead_or_blocked(self) -> bool:
+        return self.status == STATUS_DEAD_OR_BLOCKED
+
+
+def extract_clean_text(html: Optional[str], max_chars: int = PAGE_TEXT_MAX_CHARS) -> str:
+    """Return visible page text with scripts/styles removed, whitespace collapsed, capped at max_chars."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html[:_MAX_PARSE_CHARS], "html.parser")
+    for tag in soup(_STRIPPED_TAGS):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True).translate(_INVISIBLE_CHARS)
+    return " ".join(text.split())[:max_chars].rstrip()
+
+
+def _host_match(url: Optional[str], domains: Sequence[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return None
+    return next((d for d in domains if host == d or host.endswith("." + d)), None)
+
+
+def _marker_match(haystack: str, markers: Sequence[str]) -> Optional[str]:
+    return next((m for m in markers if m in haystack), None)
+
+
+def _dead(reason: str, detail: str) -> PageAssessment:
+    return PageAssessment(STATUS_DEAD_OR_BLOCKED, reason=reason, detail=detail)
+
+
+def assess_page(
+    *,
+    final_url: Optional[str],
+    http_status: Optional[int],
+    title: Optional[str],
+    text: str,
+) -> PageAssessment:
+    """Classify a loaded page as verified or dead_or_blocked (Trust+ block, parked, suspended, HTTP error).
+
+    Text markers only count on short pages so a long legitimate page that merely
+    mentions "Internet Positif" or "domain for sale" is not flagged.
+    """
+    haystack = f"{title or ''} {text}".lower()
+    short_page = len(text) <= _SHORT_PAGE_CHARS
+
+    host = _host_match(final_url, _TRUST_POSITIF_HOSTS)
+    if host:
+        return _dead(REASON_TRUST_POSITIF, f"host:{host}")
+    if short_page:
+        marker = _marker_match(haystack, _TRUST_POSITIF_MARKERS)
+        if marker:
+            return _dead(REASON_TRUST_POSITIF, f"text:{marker}")
+
+    host = _host_match(final_url, _PARKING_HOSTS)
+    if host:
+        return _dead(REASON_PARKED, f"host:{host}")
+    if short_page:
+        marker = _marker_match(haystack, _PARKED_MARKERS)
+        if marker:
+            return _dead(REASON_PARKED, f"text:{marker}")
+        marker = _marker_match(haystack, _SUSPENDED_MARKERS)
+        if marker:
+            return _dead(REASON_SUSPENDED, f"text:{marker}")
+
+    if http_status is not None and http_status >= 400:
+        return PageAssessment(
+            STATUS_DEAD_OR_BLOCKED,
+            reason=REASON_HTTP_ERROR,
+            error_code=ERR_HTTP_ERROR,
+            detail=f"HTTP {http_status}",
+        )
+
+    return PageAssessment(STATUS_VERIFIED)
 
 class SafeBrowserVerifier:
     """Async headless Chromium verifier using one clean BrowserContext per URL."""
@@ -258,6 +417,29 @@ class SafeBrowserVerifier:
 
                 title = (await page.title()).strip() or None
                 raw_html = await page.content()
+
+                clean_text = extract_clean_text(raw_html)
+                assessment = assess_page(
+                    final_url=final_url,
+                    http_status=http_status,
+                    title=title,
+                    text=clean_text,
+                )
+                if assessment.is_dead_or_blocked:
+                    return VerifyResult(
+                        input_url=raw_url,
+                        normalized_url=norm.normalized,
+                        final_url=final_url,
+                        final_normalized_url=final_norm.normalized,
+                        status=STATUS_DEAD_OR_BLOCKED,
+                        http_status=http_status,
+                        page_title=title,
+                        raw_html=raw_html,
+                        error_code=assessment.error_code,
+                        error_detail=assessment.detail,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                    )
+
                 screenshot: Optional[bytes] = None
                 if self.capture_screenshot:
                     screenshot = await page.screenshot(
