@@ -30,13 +30,14 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence,
 from src.normalizer import normalize_url
 
 CRTSH_BASE_URL = "https://crt.sh/"
-CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 DEFAULT_CT_LOG_URL = os.getenv(
     "CT_LOG_URL", "https://ct.cloudflare.com/logs/nimbus2026"
 )
 DEFAULT_MULTI_CT_LOGS: Tuple[str, ...] = (
     "https://ct.cloudflare.com/logs/nimbus2026",
     "https://wyvern.ct.digicert.com/2026h2",
+    "https://ct.googleapis.com/logs/us1/argon2026h2",
+    "https://oak.ct.letsencrypt.org/2026h2",
 )
 DEFAULT_CERTSTREAM_URL = os.getenv("CERTSTREAM_URL", "wss://certstream.calidog.io/")
 DEFAULT_CRTSH_DAYS = 7
@@ -607,7 +608,7 @@ async def tail_multi_ct_logs(
     backfill: int = 2000,
     duration_s: Optional[float] = 20.0,
     limit: Optional[int] = 25,
-    concurrency_per_log: int = 6,
+    concurrency_per_log: int = 4,
     verbose: bool = False,
 ) -> List[CertCandidate]:
     """Tail multiple official RFC 6962 CT logs in parallel and return deduped hits."""

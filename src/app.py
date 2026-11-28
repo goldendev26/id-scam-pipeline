@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
 import threading
@@ -14,14 +16,18 @@ from typing import Any, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from src.db import SupabaseDB, load_dotenv
 from src.normalizer import MAX_BATCH_ITEMS
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
+STATIC_DIR = PROJECT_ROOT / "static"
 REVIEWABLE_STATUSES = ("ai_scored", "triaged", "verified")
 ILLEGAL_AI_CATEGORIES = frozenset({"judol", "pinjol", "phishing", "scam"})
 MAX_NOTE_CHARS = 140
@@ -77,7 +83,7 @@ class CollectRequest(BaseModel):
 
 
 class VerifyQueueRequest(BaseModel):
-    limit: int = Field(default=5, ge=1, le=30)
+    limit: int = Field(default=5, ge=1, le=100)
     concurrency: int = Field(default=3, ge=1, le=6)
     timeout_ms: int = Field(default=15000, ge=3000, le=45000)
 
@@ -178,6 +184,15 @@ def _attach_signed_url(db: Any, row: dict[str, Any]) -> dict[str, Any]:
     return _attach_many(db, [row])[0]
 
 
+def _compute_asset_version() -> str:
+    mtimes = []
+    for name in ("styles.css", "app.js"):
+        p = STATIC_DIR / name
+        if p.is_file():
+            mtimes.append(str(int(p.stat().st_mtime)))
+    return "-".join(mtimes) or "1"
+
+
 def create_app(
     db: Optional[Any] = None,
     *,
@@ -188,8 +203,32 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="id-scam-pipeline Review Dashboard")
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+    state: dict[str, Any] = {"db": db, "owns_db": db is None}
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            cur_db = state.get("db")
+            if state.get("owns_db") and cur_db is not None and hasattr(cur_db, "close"):
+                try:
+                    cur_db.close()
+                except Exception:
+                    logger.exception("Failed to close SupabaseDB client during shutdown")
+
+    app = FastAPI(title="id-scam-pipeline Review Dashboard", lifespan=lifespan)
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-    state: dict[str, Any] = {"db": db}
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     def get_db() -> Any:
         if state["db"] is None:
@@ -209,6 +248,7 @@ def create_app(
                 "default_reviewer": default_reviewer,
                 "submit_target_url": raw_target,
                 "portal_browser_url": portal_browser_url,
+                "asset_version": _compute_asset_version(),
             },
         )
 
@@ -347,6 +387,21 @@ def create_app(
             "dead_or_blocked": dead_cnt,
             "items": results,
         }
+
+    @app.post("/api/pipeline/reverify-approved")
+    async def pipeline_reverify_approved(payload: Optional[VerifyQueueRequest] = None) -> dict[str, Any]:
+        """Cek ulang link status='approved' terlama sebelum hari-H; yang mati/Trust+ otomatis pindah ke dead_or_blocked."""
+        from src.worker import run_reverify_approved_pass
+
+        req = payload or VerifyQueueRequest(limit=10, concurrency=4, timeout_ms=9000)
+        cur_db = get_db()
+        return await run_reverify_approved_pass(
+            cur_db,
+            batch_size=req.limit,
+            concurrency=req.concurrency,
+            timeout_ms=req.timeout_ms,
+            verifier_factory=verifier_factory,
+        )
 
     @app.post("/api/pipeline/triage/export-prompts")
     def pipeline_triage_export_prompts(payload: Optional[TriagePromptRequest] = None) -> dict[str, Any]:

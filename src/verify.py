@@ -385,10 +385,16 @@ class SafeBrowserVerifier:
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self._browser is not None:
-            await self._browser.close()
+            try:
+                await asyncio.wait_for(self._browser.close(), timeout=5.0)
+            except Exception:
+                pass
             self._browser = None
         if self._playwright_cm is not None:
-            await self._playwright_cm.__aexit__(exc_type, exc, tb)
+            try:
+                await asyncio.wait_for(self._playwright_cm.__aexit__(exc_type, exc, tb), timeout=5.0)
+            except Exception:
+                pass
             self._playwright_cm = None
             self._playwright = None
 
@@ -485,8 +491,8 @@ class SafeBrowserVerifier:
                         elapsed_ms=int((time.monotonic() - started) * 1000),
                     )
 
-                title = (await page.title()).strip() or None
-                raw_html = await page.content()
+                title = (await asyncio.wait_for(page.title(), timeout=5.0)).strip() or None
+                raw_html = await asyncio.wait_for(page.content(), timeout=8.0)
 
                 clean_text = extract_clean_text(raw_html)
                 assessment = assess_page(
@@ -513,10 +519,13 @@ class SafeBrowserVerifier:
                 screenshot: Optional[bytes] = None
                 screenshot_path: Optional[str] = None
                 if self.capture_screenshot:
-                    raw_shot = await page.screenshot(
-                        type="jpeg",
-                        quality=self.jpeg_quality,
-                        full_page=False,
+                    raw_shot = await asyncio.wait_for(
+                        page.screenshot(
+                            type="jpeg",
+                            quality=self.jpeg_quality,
+                            full_page=False,
+                        ),
+                        timeout=min(10.0, max(3.0, self.timeout_ms / 1000.0)),
                     )
                     screenshot = compress_jpeg_to_limit(
                         raw_shot,
@@ -556,7 +565,10 @@ class SafeBrowserVerifier:
                 last_error_code = "ERR_DNS_OR_CONN"
                 last_error_detail = str(exc)[:200]
             finally:
-                await context.close()
+                try:
+                    await asyncio.wait_for(context.close(), timeout=5.0)
+                except Exception:
+                    pass
 
         return VerifyResult(
             input_url=raw_url,
@@ -592,23 +604,6 @@ def build_screenshot_path(normalized_url: str, url_id: Optional[int] = None) -> 
     """Build a sanitized Supabase Storage object path for a screenshot JPEG."""
     name = _safe_filename(normalized_url)
     return f"{url_id}_{name}" if url_id is not None else name
-
-
-def upload_verify_screenshot(
-    res: VerifyResult,
-    db: Any,
-    url_id: Optional[int] = None,
-    max_bytes: int = DEFAULT_MAX_SCREENSHOT_BYTES,
-) -> Optional[str]:
-    """Compress (<= 150 KB) and upload a VerifyResult screenshot to Supabase Storage."""
-    if not res.screenshot_bytes:
-        return None
-    jpeg = compress_jpeg_to_limit(res.screenshot_bytes, max_bytes=max_bytes)
-    storage_path = build_screenshot_path(
-        res.final_normalized_url or res.normalized_url or "page",
-        url_id=url_id,
-    )
-    return db.upload_screenshot(storage_path, jpeg)
 
 
 def save_debug_screenshot(res: VerifyResult, out_dir: Path) -> Optional[Path]:

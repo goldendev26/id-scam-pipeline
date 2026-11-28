@@ -129,13 +129,19 @@ class SupabaseDB:
         inserted = self.insert_urls([raw_url], source=source, status=status)
         return inserted[0] if inserted else None
 
-    def fetch_queue(self, status: str = "new", limit: int = 50) -> list[dict[str, Any]]:
+    def fetch_queue(
+        self,
+        status: str = "new",
+        limit: int = 50,
+        *,
+        order: str = "id.asc",
+    ) -> list[dict[str, Any]]:
         """Ambil antrean URL berdasarkan status (default 'new'), urut paling lama."""
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
             params={
                 "status": f"eq.{status}",
-                "order": "id.asc",
+                "order": order,
                 "limit": str(max(1, limit)),
             },
             headers=self._headers(),
@@ -170,17 +176,20 @@ class SupabaseDB:
         return resp.json()
 
     def get_status_counts(self) -> dict[str, int]:
-        """Hitung jumlah baris per status. Pakai RPC status_counts; fallback ke scan."""
-        try:
-            resp = self._client.post(
-                f"{self.base_url}/rest/v1/rpc/status_counts",
-                headers=self._headers({"Content-Type": "application/json"}),
-                json={},
-            )
-            resp.raise_for_status()
-            return {str(r["status"]): int(r["total"]) for r in resp.json()}
-        except (httpx.HTTPError, KeyError, TypeError, ValueError):
-            pass  # RPC belum dibuat di Supabase -> fallback scan di bawah
+        """Hitung jumlah baris per status via SQL GROUP BY RPC (fallback ke scan jika RPC belum ada)."""
+        rpc_resp = self._client.post(
+            f"{self.base_url}/rest/v1/rpc/status_counts",
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={},
+        )
+        if rpc_resp.status_code == 200:
+            counts: dict[str, int] = {}
+            for row in rpc_resp.json():
+                st = str(row.get("status") or "unknown")
+                counts[st] = int(row.get("total") or 0)
+            return counts
+        if rpc_resp.status_code != 404:
+            rpc_resp.raise_for_status()
 
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
@@ -188,7 +197,7 @@ class SupabaseDB:
             headers=self._headers(),
         )
         resp.raise_for_status()
-        counts: dict[str, int] = {}
+        counts = {}
         for row in resp.json():
             st = str(row.get("status") or "unknown")
             counts[st] = counts.get(st, 0) + 1

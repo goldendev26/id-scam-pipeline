@@ -147,6 +147,10 @@ def create_mock_app() -> FastAPI:
         submissions.append(record)
         return HTMLResponse(_render_page(submissions, last_result=record))
 
+    @mock.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @mock.get("/api/submissions")
     def api_submissions() -> dict[str, Any]:
         return {"total_submissions": len(submissions), "unique_links": len(seen_urls), "submissions": submissions}
