@@ -557,6 +557,91 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertEqual(r_imp.json()["imported_count"], 2)
         self.assertEqual(db.rows[1]["status"], "triaged")
 
+    def test_mock_target_and_auto_submit_both_modes(self):
+        from fastapi.testclient import TestClient
+        from src.app import create_app
+        from src.mock_target import create_mock_app
+        from src.submitter import SubmitResult, detect_gate_or_captcha
+
+        # 1. Mock portal accepts links & detects duplicates
+        mock_client = TestClient(create_mock_app())
+        self.assertEqual(mock_client.get("/").status_code, 200)
+        r1 = mock_client.post("/submit", content="reporter=tim1&links=https%3A%2F%2Fslot88.id%0Apinjol99.id", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(r1.status_code, 200)
+        self.assertIn('data-submit-status="ok"', r1.text)
+        r2 = mock_client.post("/submit", content="reporter=tim1&links=slot88.id%0Abaru77.id", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(r2.status_code, 200)
+        sub_summary = mock_client.get("/api/submissions").json()
+        self.assertEqual(sub_summary["total_submissions"], 2)
+        self.assertEqual(sub_summary["submissions"][1]["duplicates"], ["slot88.id"])
+        self.assertEqual(sub_summary["submissions"][1]["accepted"], ["baru77.id"])
+
+        # 2. CAPTCHA detector flags Turnstile/reCAPTCHA without attempting bypass
+        self.assertIsNotNone(detect_gate_or_captcha('<div class="cf-turnstile"></div>'))
+        self.assertIsNone(detect_gate_or_captcha('<form><textarea name="links"></textarea></form>'))
+
+        # 3. Auto-submit endpoint supports BOTH review_first and full_auto modes
+        class _SubmitDB:
+            def __init__(self):
+                self.batch_seq = 0
+                self.rows = {
+                    1: {"id": 1, "normalized_url": "approved1.id", "status": "approved", "batch_id": None, "ai_category": "judol", "ai_confidence": 0.95},
+                    2: {"id": 2, "normalized_url": "ai-high.id", "status": "triaged", "batch_id": None, "ai_category": "judol", "ai_confidence": 0.92},
+                    3: {"id": 3, "normalized_url": "ai-benign.id", "status": "triaged", "batch_id": None, "ai_category": "benign", "ai_confidence": 0.99},
+                    4: {"id": 4, "normalized_url": "ai-lowconf.id", "status": "triaged", "batch_id": None, "ai_category": "scam", "ai_confidence": 0.40},
+                }
+
+            def fetch_review_queue(self, statuses, limit=30):
+                return [r for r in self.rows.values() if r["status"] in statuses][:limit]
+
+            def update_status(self, url_id, status=None, **fields):
+                row = self.rows[url_id]
+                if status is not None:
+                    row["status"] = status
+                row.update(fields)
+                return row
+
+            def export_next_batch(self, reviewer, limit=20):
+                picked = [r for r in self.rows.values() if r["status"] == "approved" and r["batch_id"] is None][:limit]
+                if not picked:
+                    return {"batch_id": None, "reviewer": reviewer, "count": 0, "links": [], "text": "", "items": []}
+                self.batch_seq += 1
+                bid = self.batch_seq
+                for r in picked:
+                    r["status"] = "exported"
+                    r["batch_id"] = bid
+                return {"batch_id": bid, "reviewer": reviewer, "count": len(picked), "links": [r["normalized_url"] for r in picked], "text": "\n".join(r["normalized_url"] for r in picked), "items": list(picked)}
+
+            def update_batch_urls_status(self, batch_id, status, reviewer=None):
+                out = []
+                for r in self.rows.values():
+                    if r["batch_id"] == batch_id:
+                        r["status"] = status
+                        out.append(r)
+                return out
+
+        async def _fake_submitter(links, reporter="member-1", target_url=None):
+            return SubmitResult(ok=True, status="submitted", target_url=target_url or "http://127.0.0.1:8001", submitted_links=list(links), duplicate_links=[])
+
+        db = _SubmitDB()
+        client = TestClient(create_app(db=db, submitter_fn=_fake_submitter))
+
+        # Mode A: review_first -> submits ONLY pre-approved row #1 (ignores triaged #2/#3/#4)
+        res_a = client.post("/api/pipeline/auto-submit", json={"reviewer": "member-1", "mode": "review_first"})
+        self.assertEqual(res_a.status_code, 200)
+        self.assertEqual(res_a.json()["links"], ["approved1.id"])
+        self.assertEqual(db.rows[1]["status"], "submitted")
+        self.assertEqual(db.rows[2]["status"], "triaged")
+
+        # Mode B: full_auto -> auto-promotes ONLY high-confidence illegal row #2 (ignores benign #3 & low-conf #4)
+        res_b = client.post("/api/pipeline/auto-submit", json={"reviewer": "member-1", "mode": "full_auto", "min_confidence": 0.80})
+        self.assertEqual(res_b.status_code, 200)
+        self.assertEqual(res_b.json()["auto_approved"], 1)
+        self.assertEqual(res_b.json()["links"], ["ai-high.id"])
+        self.assertEqual(db.rows[2]["status"], "submitted")
+        self.assertEqual(db.rows[3]["status"], "triaged")
+        self.assertEqual(db.rows[4]["status"], "triaged")
+
 
 if __name__ == "__main__":
     unittest.main()
