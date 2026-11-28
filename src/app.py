@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import threading
+import time
 from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -99,17 +103,79 @@ def _resolve_reviewer(reviewer: Optional[str]) -> str:
     return name
 
 
-def _attach_signed_url(db: Any, row: dict[str, Any]) -> dict[str, Any]:
-    item = dict(row)
-    path = item.get("screenshot_path")
-    if path and hasattr(db, "create_signed_url"):
+SIGNED_URL_TTL_S = 3600
+SIGNED_URL_REUSE_S = 3000  # pakai ulang signed URL sampai berumur 50 menit
+_SIGNED_URL_CACHE: dict[tuple[int, str], tuple[str, float]] = {}
+_SIGNED_URL_LOCK = threading.Lock()
+_IO_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="review-io")
+
+
+def _cache_get(db: Any, path: str, now: float) -> Optional[str]:
+    with _SIGNED_URL_LOCK:
+        hit = _SIGNED_URL_CACHE.get((id(db), path))
+    if hit and now - hit[1] < SIGNED_URL_REUSE_S:
+        return hit[0]
+    return None
+
+
+def _cache_put(db: Any, mapping: dict[str, str], now: float) -> None:
+    with _SIGNED_URL_LOCK:
+        if len(_SIGNED_URL_CACHE) > 2000:
+            _SIGNED_URL_CACHE.clear()
+        for path, url in mapping.items():
+            _SIGNED_URL_CACHE[(id(db), path)] = (url, now)
+
+
+def _sign_missing(db: Any, paths: list[str]) -> dict[str, str]:
+    """Bulk sign kalau db mendukung; sisanya (atau semuanya) satu per satu paralel."""
+    signed: dict[str, str] = {}
+    if hasattr(db, "create_signed_urls"):
         try:
-            item["screenshot_url"] = db.create_signed_url(path, expires_in=3600)
+            signed = dict(db.create_signed_urls(paths, expires_in=SIGNED_URL_TTL_S))
         except Exception:
-            item["screenshot_url"] = None
-    else:
-        item.setdefault("screenshot_url", None)
-    return item
+            signed = {}
+    leftover = [p for p in paths if p not in signed]
+    if leftover and hasattr(db, "create_signed_url"):
+        def _one(p: str) -> tuple[str, Optional[str]]:
+            try:
+                return p, db.create_signed_url(p, expires_in=SIGNED_URL_TTL_S)
+            except Exception:
+                return p, None
+
+        for p, url in _IO_POOL.map(_one, leftover):
+            if url:
+                signed[p] = url
+    return signed
+
+
+def _attach_many(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tambahkan screenshot_url ke banyak baris dengan cache + bulk signing."""
+    now = time.monotonic()
+    urls: dict[str, str] = {}
+    missing: list[str] = []
+    for path in {r.get("screenshot_path") for r in rows if r.get("screenshot_path")}:
+        cached = _cache_get(db, path, now)
+        if cached:
+            urls[path] = cached
+        else:
+            missing.append(path)
+    if missing:
+        fresh = _sign_missing(db, missing)
+        _cache_put(db, fresh, now)
+        urls.update(fresh)
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        path = item.get("screenshot_path")
+        item["screenshot_url"] = urls.get(path) if path else None
+        out.append(item)
+    return out
+
+
+def _attach_signed_url(db: Any, row: dict[str, Any]) -> dict[str, Any]:
+    """Versi 1 baris (dipakai endpoint lock)."""
+    return _attach_many(db, [row])[0]
 
 
 def create_app(
@@ -121,6 +187,7 @@ def create_app(
     submitter_fn: Optional[Any] = None,
 ) -> FastAPI:
     app = FastAPI(title="id-scam-pipeline Review Dashboard")
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     state: dict[str, Any] = {"db": db}
 
@@ -503,26 +570,42 @@ def create_app(
 
     @app.get("/api/review/queue")
     def review_queue(
-        limit: int = Query(default=30, ge=1, le=100),
+        limit: int = Query(default=15, ge=1, le=100),
+        counts: bool = Query(default=True),
+        exclude: Optional[str] = Query(default=None, max_length=2000),
     ) -> dict[str, Any]:
-        """Ambil galeri item siap review lengkap dengan signed URL screenshot & ringkasan status."""
+        """Galeri siap review. `counts=false` dan `exclude=1,2,3` dipakai UI saat refill."""
         cur_db = get_db()
-        rows = cur_db.fetch_review_queue(statuses=REVIEWABLE_STATUSES, limit=limit)
-        items = [_attach_signed_url(cur_db, row) for row in rows]
-        counts = cur_db.get_status_counts() if hasattr(cur_db, "get_status_counts") else {}
-        return {
-            "items": items,
-            "counts": {
-                "review_queue": sum(counts.get(s, 0) for s in REVIEWABLE_STATUSES),
-                "approved": counts.get("approved", 0),
-                "exported": counts.get("exported", 0),
-                "submitted": counts.get("submitted", 0),
-                "claimed_external": counts.get("claimed_external", 0),
-                "skipped": counts.get("skipped", 0),
-                "new": counts.get("new", 0),
-                "verified": counts.get("verified", 0),
-            },
-        }
+        exclude_ids = [int(x) for x in (exclude or "").split(",") if x.strip().isdigit()][:200]
+        extra: dict[str, Any] = {"exclude_ids": exclude_ids} if exclude_ids else {}
+
+        counts_future = (
+            _IO_POOL.submit(cur_db.get_status_counts)
+            if counts and hasattr(cur_db, "get_status_counts")
+            else None
+        )
+        rows = cur_db.fetch_review_queue(statuses=REVIEWABLE_STATUSES, limit=limit, **extra)
+        items = _attach_many(cur_db, rows)
+
+        payload: dict[str, Any] = {"items": items}
+        if counts:
+            status_counts: dict[str, int] = {}
+            if counts_future is not None:
+                try:
+                    status_counts = counts_future.result(timeout=10)
+                except Exception:
+                    status_counts = {}
+            payload["counts"] = {
+                "review_queue": sum(status_counts.get(s, 0) for s in REVIEWABLE_STATUSES),
+                "approved": status_counts.get("approved", 0),
+                "exported": status_counts.get("exported", 0),
+                "submitted": status_counts.get("submitted", 0),
+                "claimed_external": status_counts.get("claimed_external", 0),
+                "skipped": status_counts.get("skipped", 0),
+                "new": status_counts.get("new", 0),
+                "verified": status_counts.get("verified", 0),
+            }
+        return payload
 
     @app.post("/api/review/{url_id}/decide")
     def decide_review(url_id: int, payload: ReviewDecisionRequest) -> dict[str, Any]:

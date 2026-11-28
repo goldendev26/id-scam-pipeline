@@ -177,3 +177,22 @@ GRANT EXECUTE ON FUNCTION public.claim_url_for_review(TEXT, BIGINT, TEXT[], INTE
 
 REVOKE ALL ON FUNCTION public.export_next_batch(TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.export_next_batch(TEXT, INTEGER) TO service_role;
+
+-- Hitung status di DB (GROUP BY), bukan scan seluruh tabel dari Python.
+CREATE OR REPLACE FUNCTION public.status_counts()
+RETURNS TABLE (status TEXT, total BIGINT)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $$
+    SELECT u.status, COUNT(*) FROM public.urls u GROUP BY u.status;
+$$;
+
+REVOKE ALL ON FUNCTION public.status_counts() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.status_counts() TO service_role;
+
+-- Index untuk antrean review (urut ai_confidence tertinggi).
+CREATE INDEX IF NOT EXISTS idx_urls_review_queue
+    ON urls (ai_confidence DESC NULLS LAST, id ASC)
+    WHERE status IN ('ai_scored', 'triaged', 'verified');

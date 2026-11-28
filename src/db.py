@@ -147,24 +147,41 @@ class SupabaseDB:
         self,
         statuses: Sequence[str] = ("ai_scored", "triaged", "verified"),
         limit: int = 30,
+        exclude_ids: Sequence[int] = (),
     ) -> list[dict[str, Any]]:
-        """Ambil antrean review (screenshot + info AI), urut confidence tertinggi."""
+        """Ambil antrean review (screenshot + info AI), urut confidence tertinggi.
+
+        `exclude_ids` dipakai UI saat refill agar item yang sudah dimuat tidak ditarik lagi.
+        """
         joined = ",".join(statuses)
+        params: dict[str, str] = {
+            "status": f"in.({joined})",
+            "order": "ai_confidence.desc.nullslast,id.asc",
+            "limit": str(max(1, limit)),
+        }
+        if exclude_ids:
+            params["id"] = "not.in.(" + ",".join(str(int(i)) for i in exclude_ids) + ")"
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
-            params={
-                "status": f"in.({joined})",
-                "order": "ai_confidence.desc.nullslast,id.asc",
-                "limit": str(max(1, limit)),
-            },
+            params=params,
             headers=self._headers(),
         )
         resp.raise_for_status()
         return resp.json()
 
     def get_status_counts(self) -> dict[str, int]:
-        """Hitung jumlah baris per status untuk ringkasan dashboard."""
-        # ponytail: single select=status scan; ganti ke SQL GROUP BY RPC jika >50k baris.
+        """Hitung jumlah baris per status. Pakai RPC status_counts; fallback ke scan."""
+        try:
+            resp = self._client.post(
+                f"{self.base_url}/rest/v1/rpc/status_counts",
+                headers=self._headers({"Content-Type": "application/json"}),
+                json={},
+            )
+            resp.raise_for_status()
+            return {str(r["status"]): int(r["total"]) for r in resp.json()}
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            pass  # RPC belum dibuat di Supabase -> fallback scan di bawah
+
         resp = self._client.get(
             f"{self.base_url}/rest/v1/urls",
             params={"select": "status"},
@@ -441,3 +458,23 @@ class SupabaseDB:
         if signed.startswith("http"):
             return signed
         return f"{self.base_url}/storage/v1{signed}"
+
+    def create_signed_urls(self, storage_paths: Sequence[str], expires_in: int = 3600) -> dict[str, str]:
+        """Bulk sign: 1 request untuk banyak path. Return {path: signed_url}."""
+        clean = [p.lstrip("/") for p in storage_paths if p]
+        if not clean:
+            return {}
+        resp = self._client.post(
+            f"{self.base_url}/storage/v1/object/sign/{self.bucket}",
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"expiresIn": expires_in, "paths": clean},
+        )
+        resp.raise_for_status()
+        out: dict[str, str] = {}
+        for entry in resp.json():
+            signed = entry.get("signedURL")
+            path = entry.get("path")
+            if not signed or not path:
+                continue
+            out[path] = signed if signed.startswith("http") else f"{self.base_url}/storage/v1{signed}"
+        return out
