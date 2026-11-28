@@ -150,7 +150,11 @@ def create_app(
             if collector_fn is not None:
                 candidates = await collector_fn(req)
             else:
-                from src.cert_collector import DEFAULT_CRTSH_KEYWORDS, fetch_crtsh, tail_ct_log
+                from src.cert_collector import (
+                    DEFAULT_CRTSH_KEYWORDS,
+                    fetch_crtsh,
+                    tail_multi_ct_logs,
+                )
 
                 if req.mode == "crtsh":
                     kws = req.keywords or list(DEFAULT_CRTSH_KEYWORDS)
@@ -161,14 +165,12 @@ def create_app(
                         verbose=False,
                     )
                 else:
-                    candidates = []
-                    async for item in tail_ct_log(
+                    candidates = await tail_multi_ct_logs(
                         backfill=req.backfill,
                         duration_s=req.duration,
                         limit=req.limit,
                         verbose=False,
-                    ):
-                        candidates.append(item)
+                    )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Collector gagal: {exc}") from exc
 
