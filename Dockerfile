@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY scripts/ ./scripts/
+COPY templates/ ./templates/
 COPY tests/ ./tests/
 
 RUN chown -R pwuser:pwuser /app

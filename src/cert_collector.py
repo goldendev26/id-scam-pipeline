@@ -34,6 +34,10 @@ CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 DEFAULT_CT_LOG_URL = os.getenv(
     "CT_LOG_URL", "https://ct.cloudflare.com/logs/nimbus2026"
 )
+DEFAULT_MULTI_CT_LOGS: Tuple[str, ...] = (
+    "https://ct.cloudflare.com/logs/nimbus2026",
+    "https://wyvern.ct.digicert.com/2026h2",
+)
 DEFAULT_CERTSTREAM_URL = os.getenv("CERTSTREAM_URL", "wss://certstream.calidog.io/")
 DEFAULT_CRTSH_DAYS = 7
 DEFAULT_CRTSH_KEYWORDS = (
@@ -596,6 +600,51 @@ async def tail_ct_log(
                     file=sys.stderr,
                     flush=True,
                 )
+
+
+async def tail_multi_ct_logs(
+    log_urls: Sequence[str] = DEFAULT_MULTI_CT_LOGS,
+    backfill: int = 2000,
+    duration_s: Optional[float] = 20.0,
+    limit: Optional[int] = 25,
+    concurrency_per_log: int = 6,
+    verbose: bool = False,
+) -> List[CertCandidate]:
+    """Tail multiple official RFC 6962 CT logs in parallel and return deduped hits."""
+    if not log_urls:
+        return []
+
+    per_log_limit = limit if limit is not None else None
+
+    async def _collect_one(url: str) -> List[CertCandidate]:
+        items: List[CertCandidate] = []
+        try:
+            async for hit in tail_ct_log(
+                log_url=url,
+                backfill=backfill,
+                duration_s=duration_s,
+                limit=per_log_limit,
+                concurrency=concurrency_per_log,
+                verbose=verbose,
+            ):
+                items.append(hit)
+        except Exception as exc:
+            if verbose:
+                print(f"[ct-multi] {url} error: {exc}", file=sys.stderr, flush=True)
+        return items
+
+    batches = await asyncio.gather(*(_collect_one(u) for u in log_urls))
+    seen: Set[str] = set()
+    merged: List[CertCandidate] = []
+    for batch in batches:
+        for item in batch:
+            if item.normalized_url in seen:
+                continue
+            seen.add(item.normalized_url)
+            merged.append(item)
+            if limit is not None and len(merged) >= limit:
+                return merged
+    return merged
 
 
 async def fetch_crtsh(

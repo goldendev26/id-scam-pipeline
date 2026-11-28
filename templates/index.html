@@ -1689,6 +1689,9 @@
     async function loadQueue() {
       try {
         const res = await fetch("/api/review/queue?limit=40");
+        if (res.status === 404 || res.status === 405) {
+          throw new Error("Backend FastAPI belum aktif. Jalankan `docker compose up dashboard` lalu buka http://127.0.0.1:8000 (jangan pakai Live Server).");
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         state.items = data.items || [];
