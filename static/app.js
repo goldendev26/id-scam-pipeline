@@ -10,6 +10,7 @@
     batches: [],
     lastExportBatchId: null,
     selectedIndex: -1,
+    filterMode: localStorage.getItem("gallery_filter") || "all",
     autoLoop: false,
     autoRunning: false,
     autoCycle: 0,
@@ -612,18 +613,23 @@
   }
 
   function renderGallery(withInspector = true) {
-    if (state.loading || (!state.items.length && state.fetching)) {
+    syncFilterUi();
+    const list = visibleItems();
+    if (state.loading || (!list.length && state.fetching)) {
       els.gallery.innerHTML = skeletonCards(6);
       if (withInspector) renderInspector();
       return;
     }
-    if (!state.items.length) {
-      els.gallery.innerHTML = `<div class="empty-state">Antrean review kosong. Jalankan <strong>Auto Pipeline</strong> atau <strong>Browser Capture</strong> di atas.</div>`;
+    if (!list.length) {
+      const msg = state.items.length
+        ? `Semua ${state.items.length} situs saat ini berkategori benign. Klik <strong>Semua</strong> untuk menampilkannya.`
+        : `Antrean review kosong. Jalankan <strong>Auto Pipeline</strong> atau <strong>Browser Capture</strong> di atas.`;
+      els.gallery.innerHTML = `<div class="empty-state">${msg}</div>`;
       if (withInspector) renderInspector();
       return;
     }
     const me = getReviewer();
-    els.gallery.innerHTML = state.items.map((item, idx) => cardHtml(item, idx, me)).join("");
+    els.gallery.innerHTML = list.map((item, idx) => cardHtml(item, idx, me)).join("");
     const activeEl = els.gallery.querySelector(".card.active");
     if (activeEl) activeEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
     if (withInspector) renderInspector();
@@ -676,8 +682,9 @@
 
   /* --- Image preloading: screenshot 2-3 item berikutnya diunduh di latar belakang --- */
   function preloadAhead() {
+    const list = visibleItems();
     for (let i = 0; i <= PRELOAD_AHEAD; i++) {
-      const it = state.items[state.selectedIndex + i];
+      const it = list[state.selectedIndex + i];
       if (!it || !it.screenshot_url || state.preloaded.has(it.screenshot_url)) continue;
       state.preloaded.add(it.screenshot_url);
       const img = new Image();
@@ -718,17 +725,19 @@
   }
 
   function selectIndex(idx, shouldLock = true) {
-    if (!state.items.length) {
+    const list = visibleItems();
+    if (!list.length) {
       state.selectedIndex = -1;
       renderGallery();
       return;
     }
-    state.selectedIndex = Math.max(0, Math.min(idx, state.items.length - 1));
+    state.selectedIndex = Math.max(0, Math.min(idx, list.length - 1));
     highlightActive();
     renderInspector();
     preloadAhead();
     maybeRefill();
-    if (shouldLock) scheduleLock(currentItem().id);
+    const cur = currentItem();
+    if (shouldLock && cur) scheduleLock(cur.id);
   }
 
   /* --- Progressive fetch: tarikan awal kecil, refill otomatis saat sisa menipis --- */
@@ -748,12 +757,13 @@
       state.items = fetched.filter((i) => !state.pending.has(i.id));
       state.exhausted = fetched.length < PAGE_SIZE;
       state.loading = false;
-      state.selectedIndex = state.items.length ? 0 : -1;
+      const list = visibleItems();
+      state.selectedIndex = list.length ? 0 : -1;
       renderCounts(data.counts);
       renderGallery();
-      if (state.items.length) {
+      if (list.length) {
         preloadAhead();
-        scheduleLock(state.items[0].id);
+        scheduleLock(list[0].id);
       }
       maybeRefill();
     } catch (err) {
@@ -766,12 +776,13 @@
 
   async function maybeRefill() {
     if (state.loading || state.fetching || state.exhausted) return;
-    if (state.items.length > REFILL_THRESHOLD) return;
+    if (visibleItems().length > REFILL_THRESHOLD) return;
     const epoch = state.epoch;
     const heldIds = [...state.items.map((i) => i.id), ...state.pending.keys()];
     const exclude = heldIds.slice(-150).join(",");
     state.fetching = true;
-    if (!state.items.length) renderGallery(false);
+    const prevVisibleCount = visibleItems().length;
+    if (!prevVisibleCount) renderGallery(false);
     try {
       const res = await fetch(
         `/api/review/queue?limit=${PAGE_SIZE}&counts=false&exclude=${encodeURIComponent(exclude)}`
@@ -779,6 +790,7 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (epoch !== state.epoch) return;
+      state.fetching = false;
       const fetched = data.items || [];
       const known = new Set(state.items.map((i) => i.id));
       const fresh = fetched.filter((i) => !known.has(i.id) && !state.pending.has(i.id));
@@ -786,24 +798,29 @@
       if (fresh.length) {
         const startIdx = state.items.length;
         state.items.push(...fresh);
-        if (startIdx === 0) {
-          state.selectedIndex = 0;
+        const listAfter = visibleItems();
+        if (prevVisibleCount === 0) {
+          state.selectedIndex = listAfter.length ? 0 : -1;
           renderGallery();
-          scheduleLock(state.items[0].id);
-        } else {
+          if (listAfter.length) scheduleLock(listAfter[0].id);
+        } else if (state.filterMode === "all") {
           const me = getReviewer();
           els.gallery.insertAdjacentHTML(
             "beforeend",
             fresh.map((item, k) => cardHtml(item, startIdx + k, me)).join("")
           );
+          syncFilterUi();
+        } else {
+          renderGallery();
         }
         preloadAhead();
-      } else if (!state.items.length) {
+      } else if (!visibleItems().length) {
         renderGallery();
       }
     } catch (err) {
+      state.fetching = false;
       console.warn("Refill gagal:", err);
-      if (!state.items.length) renderGallery();
+      if (!visibleItems().length) renderGallery();
     } finally {
       state.fetching = false;
     }
@@ -817,16 +834,19 @@
     if (action === "approve_note") {
       payload.note = (customNote !== null ? customNote : els.noteInput.value).trim().slice(0, 140);
     }
-    const idx = state.selectedIndex;
+    const visIdx = state.selectedIndex;
+    const masterIdx = state.items.findIndex((r) => r.id === item.id);
+    if (masterIdx === -1) return;
     const countEl = action === "skip" ? els.cntSkipped : els.cntApproved;
     const label = action === "skip" ? "Skipped" : (action === "approve_note" ? "Approved + Note" : "Approved");
     state.pending.set(item.id, item);
-    state.items.splice(idx, 1);
+    state.items.splice(masterIdx, 1);
     bumpCount(els.cntQueue, -1);
     bumpCount(countEl, 1);
     showToast(`${label}: ${item.normalized_url}`);
     els.noteInput.blur();
-    state.selectedIndex = state.items.length ? Math.min(idx, state.items.length - 1) : -1;
+    const nextList = visibleItems();
+    state.selectedIndex = nextList.length ? Math.min(visIdx, nextList.length - 1) : -1;
     renderGallery();
     const next = currentItem();
     if (next) {
@@ -847,11 +867,12 @@
     }).catch((err) => {
       state.pending.delete(item.id);
       // Rollback: kembalikan item ke posisi semula & koreksi counter.
-      const at = Math.min(idx, state.items.length);
+      const at = Math.min(masterIdx, state.items.length);
       state.items.splice(at, 0, item);
       bumpCount(els.cntQueue, 1);
       bumpCount(countEl, -1);
-      state.selectedIndex = at;
+      const restoredIdx = visibleItems().findIndex((r) => r.id === item.id);
+      if (restoredIdx !== -1) state.selectedIndex = restoredIdx;
       renderGallery();
       preloadAhead();
       showToast(`Gagal menyimpan ${item.normalized_url}: ${err.message}. Item dikembalikan ke antrean.`);
@@ -1018,7 +1039,13 @@
     state.filterMode = mode === "illegal" ? "illegal" : "all";
     localStorage.setItem("gallery_filter", state.filterMode);
     const list = visibleItems();
-    selectIndex(list.length ? 0 : -1, false);
+    state.selectedIndex = list.length ? 0 : -1;
+    renderGallery();
+    if (list.length) {
+      preloadAhead();
+      scheduleLock(list[0].id);
+    }
+    maybeRefill();
   }
   if (els.btnFilterAll) els.btnFilterAll.addEventListener("click", () => setFilterMode("all"));
   if (els.btnFilterIllegal) els.btnFilterIllegal.addEventListener("click", () => setFilterMode("illegal"));

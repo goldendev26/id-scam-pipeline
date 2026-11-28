@@ -201,8 +201,6 @@ def create_app(
     ai_client: Optional[Any] = None,
     submitter_fn: Optional[Any] = None,
 ) -> FastAPI:
-    app = FastAPI(title="id-scam-pipeline Review Dashboard")
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
     state: dict[str, Any] = {"db": db, "owns_db": db is None}
 
     @asynccontextmanager
@@ -218,6 +216,7 @@ def create_app(
                     logger.exception("Failed to close SupabaseDB client during shutdown")
 
     app = FastAPI(title="id-scam-pipeline Review Dashboard", lifespan=lifespan)
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
