@@ -194,10 +194,3 @@ GRANT EXECUTE ON FUNCTION public.export_next_batch(TEXT, INTEGER) TO service_rol
 
 REVOKE ALL ON FUNCTION public.status_counts() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.status_counts() TO service_role;
-
--- Index untuk antrean review (urut ai_confidence tertinggi).
-CREATE INDEX IF NOT EXISTS idx_urls_review_queue
-    ON urls (ai_confidence DESC NULLS LAST, id ASC)
-    WHERE status IN ('ai_scored', 'triaged', 'verified');
-REVOKE ALL ON FUNCTION public.status_counts() FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.status_counts() TO service_role;

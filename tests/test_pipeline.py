@@ -345,8 +345,12 @@ class TestAppAtomicExport(unittest.TestCase):
                     },
                 }
 
-            def fetch_review_queue(self, statuses, limit=30):
-                return [r for r in self.rows.values() if r["status"] in statuses][:limit]
+            def fetch_review_queue(self, statuses, limit=30, exclude_ids=()):
+                excluded = set(exclude_ids or ())
+                return [
+                    r for r in self.rows.values()
+                    if r["status"] in statuses and r["id"] not in excluded
+                ][:limit]
 
             def get_status_counts(self):
                 counts = {}
@@ -366,7 +370,12 @@ class TestAppAtomicExport(unittest.TestCase):
                 return self.rows[url_id]
 
         db = _GalleryDB()
-        client = TestClient(create_app(db=db))
+        app = create_app(db=db)
+        self.assertTrue(
+            any(m.cls.__name__ == "GZipMiddleware" for m in app.user_middleware),
+            "GZipMiddleware must remain registered on the FastAPI app",
+        )
+        client = TestClient(app)
 
         # 1. GET / serves separated templates/index.html with static CSS/JS & security headers
         html = client.get("/")
@@ -392,14 +401,22 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertIn('key === "a"', js.text)
         self.assertIn('key === "n"', js.text)
         self.assertIn('key === "x"', js.text)
+        self.assertIn("filterMode:", js.text)
+        self.assertIn("syncFilterUi()", js.text)
 
-        # 2. GET /api/review/queue returns signed URLs & live counts
+        # 2. GET /api/review/queue returns signed URLs & live counts, and supports progressive exclude + counts=false
         q = client.get("/api/review/queue")
         self.assertEqual(q.status_code, 200)
         qdata = q.json()
         self.assertEqual(len(qdata["items"]), 3)
         self.assertIn("/object/sign/screenshots/1_slot99.id.jpg", qdata["items"][0]["screenshot_url"])
         self.assertEqual(qdata["counts"]["review_queue"], 3)
+
+        q_refill = client.get("/api/review/queue?limit=2&counts=false&exclude=1")
+        self.assertEqual(q_refill.status_code, 200)
+        q_refill_data = q_refill.json()
+        self.assertEqual([item["id"] for item in q_refill_data["items"]], [2, 3])
+        self.assertNotIn("counts", q_refill_data)
 
         # 3. A (approve), N (approve_note), X (skip)
         r_a = client.post("/api/review/1/decide", json={"reviewer": "member-1", "action": "approve"})
@@ -645,8 +662,12 @@ class TestAppAtomicExport(unittest.TestCase):
                     6: {"id": 6, "normalized_url": "triaged-nullconf.id", "status": "triaged", "batch_id": None, "ai_category": "judol", "ai_confidence": None},
                 }
 
-            def fetch_review_queue(self, statuses, limit=30):
-                return [r for r in self.rows.values() if r["status"] in statuses][:limit]
+            def fetch_review_queue(self, statuses, limit=30, exclude_ids=()):
+                excluded = set(exclude_ids or ())
+                return [
+                    r for r in self.rows.values()
+                    if r["status"] in statuses and r["id"] not in excluded
+                ][:limit]
 
             def fetch_batch_by_id(self, batch_id):
                 items = [r for r in self.rows.values() if r.get("batch_id") == batch_id]
