@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from src.db import SupabaseDB, load_dotenv
 from src.normalizer import MAX_BATCH_ITEMS
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
+STATIC_DIR = PROJECT_ROOT / "static"
 REVIEWABLE_STATUSES = ("ai_scored", "triaged", "verified")
 ILLEGAL_AI_CATEGORIES = frozenset({"judol", "pinjol", "phishing", "scam"})
 MAX_NOTE_CHARS = 140
@@ -120,9 +126,32 @@ def create_app(
     ai_client: Optional[Any] = None,
     submitter_fn: Optional[Any] = None,
 ) -> FastAPI:
-    app = FastAPI(title="id-scam-pipeline Review Dashboard")
+    state: dict[str, Any] = {"db": db, "owns_db": db is None}
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            cur_db = state.get("db")
+            if state.get("owns_db") and cur_db is not None and hasattr(cur_db, "close"):
+                try:
+                    cur_db.close()
+                except Exception:
+                    logger.exception("Failed to close SupabaseDB client during shutdown")
+
+    app = FastAPI(title="id-scam-pipeline Review Dashboard", lifespan=lifespan)
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-    state: dict[str, Any] = {"db": db}
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     def get_db() -> Any:
         if state["db"] is None:

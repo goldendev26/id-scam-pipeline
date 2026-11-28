@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import ipaddress
 import json
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.cert_collector import is_official_domain
 from src.normalizer import normalize_url
