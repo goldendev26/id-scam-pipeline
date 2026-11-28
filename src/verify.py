@@ -358,10 +358,29 @@ class SafeBrowserVerifier:
 
         self._playwright_cm = self._playwright_factory()
         self._playwright = await self._playwright_cm.__aenter__()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=CHROMIUM_ARGS,
-        )
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=CHROMIUM_ARGS,
+            )
+        except Exception as exc:
+            if "executable doesn't exist" not in str(exc).lower():
+                raise
+            # Local dev fallback when Playwright bundled Chromium isn't installed.
+            launched = None
+            for channel in ("chrome", "msedge"):
+                try:
+                    launched = await self._playwright.chromium.launch(
+                        headless=True,
+                        channel=channel,
+                        args=CHROMIUM_ARGS,
+                    )
+                    break
+                except Exception:
+                    continue
+            if launched is None:
+                raise
+            self._browser = launched
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:

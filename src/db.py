@@ -143,6 +143,40 @@ class SupabaseDB:
         resp.raise_for_status()
         return resp.json()
 
+    def fetch_review_queue(
+        self,
+        statuses: Sequence[str] = ("ai_scored", "triaged", "verified"),
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Ambil antrean review (screenshot + info AI), urut confidence tertinggi."""
+        joined = ",".join(statuses)
+        resp = self._client.get(
+            f"{self.base_url}/rest/v1/urls",
+            params={
+                "status": f"in.({joined})",
+                "order": "ai_confidence.desc.nullslast,id.asc",
+                "limit": str(max(1, limit)),
+            },
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_status_counts(self) -> dict[str, int]:
+        """Hitung jumlah baris per status untuk ringkasan dashboard."""
+        # ponytail: single select=status scan; ganti ke SQL GROUP BY RPC jika >50k baris.
+        resp = self._client.get(
+            f"{self.base_url}/rest/v1/urls",
+            params={"select": "status"},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        counts: dict[str, int] = {}
+        for row in resp.json():
+            st = str(row.get("status") or "unknown")
+            counts[st] = counts.get(st, 0) + 1
+        return counts
+
     def update_status(
         self,
         url_id: int,
@@ -176,7 +210,7 @@ class SupabaseDB:
         self,
         reviewer: str,
         url_id: Optional[int] = None,
-        statuses: Sequence[str] = ("verified", "triaged"),
+        statuses: Sequence[str] = ("ai_scored", "triaged", "verified"),
         ttl_minutes: int = 15,
     ) -> Optional[dict[str, Any]]:
         """Atomically claim a review lock via Postgres FOR UPDATE SKIP LOCKED RPC."""
@@ -258,6 +292,82 @@ class SupabaseDB:
                 for r in rows
             ],
         }
+
+    def fetch_batches(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Ambil riwayat batch terbaru beserta daftar URL dan ringkasan statusnya."""
+        resp = self._client.get(
+            f"{self.base_url}/rest/v1/batches",
+            params={"order": "id.desc", "limit": str(max(1, limit))},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        batches: list[dict[str, Any]] = resp.json() if resp.content else []
+        if not batches:
+            return []
+
+        batch_ids = ",".join(str(b["id"]) for b in batches)
+        urls_resp = self._client.get(
+            f"{self.base_url}/rest/v1/urls",
+            params={
+                "batch_id": f"in.({batch_ids})",
+                "select": "id,batch_id,normalized_url,status,ai_category,ai_note",
+                "order": "id.asc",
+            },
+            headers=self._headers(),
+        )
+        urls_resp.raise_for_status()
+        grouped: dict[int, list[dict[str, Any]]] = {int(b["id"]): [] for b in batches}
+        for u in urls_resp.json() if urls_resp.content else []:
+            bid = u.get("batch_id")
+            if bid is not None and int(bid) in grouped:
+                grouped[int(bid)].append(u)
+
+        result: list[dict[str, Any]] = []
+        for b in batches:
+            items = grouped.get(int(b["id"]), [])
+            status_counts: dict[str, int] = {}
+            for item in items:
+                st = str(item.get("status") or "unknown")
+                status_counts[st] = status_counts.get(st, 0) + 1
+            links = [item["normalized_url"] for item in items]
+            result.append(
+                {
+                    **b,
+                    "links": links,
+                    "text": "\n".join(links),
+                    "items": items,
+                    "status_counts": status_counts,
+                }
+            )
+        return result
+
+    def update_batch_urls_status(
+        self,
+        batch_id: int,
+        status: str,
+        reviewer: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Update status seluruh URL dalam satu batch (mis. submitted / claimed_external)."""
+        payload: dict[str, Any] = {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if reviewer and reviewer.strip():
+            payload["reviewed_by"] = reviewer.strip()
+
+        resp = self._client.patch(
+            f"{self.base_url}/rest/v1/urls",
+            params={"batch_id": f"eq.{batch_id}"},
+            headers=self._headers(
+                {
+                    "Content-Type": "application/json",
+                    "Prefer": "return=representation",
+                }
+            ),
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.content else []
 
     def upload_screenshot(
         self,

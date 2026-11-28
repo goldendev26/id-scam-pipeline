@@ -291,6 +291,272 @@ class TestAppAtomicExport(unittest.TestCase):
         self.assertEqual(empty["count"], 0)
         self.assertEqual(len(fake_db.batches), 3)
 
+    def test_index_html_review_queue_and_anx_decisions(self):
+        from fastapi.testclient import TestClient
+        from src.app import create_app
+
+        class _GalleryDB:
+            def __init__(self):
+                self.rows = {
+                    1: {
+                        "id": 1,
+                        "normalized_url": "slot99.id",
+                        "status": "triaged",
+                        "page_title": "Slot 99",
+                        "ai_category": "judol",
+                        "ai_confidence": 0.96,
+                        "ai_note": "Promo slot deposit dana",
+                        "screenshot_path": "1_slot99.id.jpg",
+                        "locked_by": None,
+                    },
+                    2: {
+                        "id": 2,
+                        "normalized_url": "pinjol88.id",
+                        "status": "ai_scored",
+                        "page_title": "Pinjol Cepat",
+                        "ai_category": "pinjol",
+                        "ai_confidence": 0.88,
+                        "ai_note": "Pinjaman ilegal",
+                        "screenshot_path": "2_pinjol88.id.jpg",
+                        "locked_by": None,
+                    },
+                    3: {
+                        "id": 3,
+                        "normalized_url": "berita.id",
+                        "status": "verified",
+                        "page_title": "Portal Berita",
+                        "ai_category": "benign",
+                        "ai_confidence": 0.12,
+                        "ai_note": "Situs berita normal",
+                        "screenshot_path": None,
+                        "locked_by": None,
+                    },
+                }
+
+            def fetch_review_queue(self, statuses, limit=30):
+                return [r for r in self.rows.values() if r["status"] in statuses][:limit]
+
+            def get_status_counts(self):
+                counts = {}
+                for r in self.rows.values():
+                    counts[r["status"]] = counts.get(r["status"], 0) + 1
+                return counts
+
+            def create_signed_url(self, path, expires_in=3600):
+                return f"https://demo.supabase.co/storage/v1/object/sign/screenshots/{path}?token=abc"
+
+            def update_status(self, url_id, status=None, **fields):
+                if url_id not in self.rows:
+                    return None
+                if status is not None:
+                    self.rows[url_id]["status"] = status
+                self.rows[url_id].update(fields)
+                return self.rows[url_id]
+
+        db = _GalleryDB()
+        client = TestClient(create_app(db=db))
+
+        # 1. GET / serves templates/index.html with A/N/X shortcuts, Auto strip, and gallery markup
+        html = client.get("/")
+        self.assertEqual(html.status_code, 200)
+        self.assertIn("Copy Next 20 Links", html.text)
+        self.assertIn("Auto Pipeline", html.text)
+        self.assertIn("Mulai Otomatis", html.text)
+        self.assertIn('data-theme="light"', html.text)
+        self.assertIn('id="btnTheme"', html.text)
+        self.assertIn('key === "a"', html.text)
+        self.assertIn('key === "n"', html.text)
+        self.assertIn('key === "x"', html.text)
+
+        # 2. GET /api/review/queue returns signed URLs & live counts
+        q = client.get("/api/review/queue")
+        self.assertEqual(q.status_code, 200)
+        qdata = q.json()
+        self.assertEqual(len(qdata["items"]), 3)
+        self.assertIn("/object/sign/screenshots/1_slot99.id.jpg", qdata["items"][0]["screenshot_url"])
+        self.assertEqual(qdata["counts"]["review_queue"], 3)
+
+        # 3. A (approve), N (approve_note), X (skip)
+        r_a = client.post("/api/review/1/decide", json={"reviewer": "member-1", "action": "approve"})
+        self.assertEqual(r_a.status_code, 200)
+        self.assertEqual(db.rows[1]["status"], "approved")
+
+        r_n = client.post(
+            "/api/review/2/decide",
+            json={"reviewer": "member-2", "action": "approve_note", "note": "Pinjol ilegal tanpa izin OJK"},
+        )
+        self.assertEqual(r_n.status_code, 200)
+        self.assertEqual(db.rows[2]["status"], "approved")
+        self.assertEqual(db.rows[2]["ai_note"], "Pinjol ilegal tanpa izin OJK")
+
+        r_x = client.post("/api/review/3/decide", json={"reviewer": "member-3", "action": "skip"})
+        self.assertEqual(r_x.status_code, 200)
+        self.assertEqual(db.rows[3]["status"], "skipped")
+
+    def test_batch_history_and_mark_submitted_or_claimed_external(self):
+        from fastapi.testclient import TestClient
+        from src.app import create_app
+
+        class _BatchHistoryDB:
+            def __init__(self):
+                self.batches = [{"id": 10, "reviewer": "member-1", "url_count": 2, "created_at": "2026-11-28T04:00:00Z"}]
+                self.urls = {
+                    101: {"id": 101, "batch_id": 10, "normalized_url": "slot1.id", "status": "exported"},
+                    102: {"id": 102, "batch_id": 10, "normalized_url": "slot2.id", "status": "exported"},
+                }
+
+            def fetch_batches(self, limit=20):
+                items = list(self.urls.values())
+                links = [u["normalized_url"] for u in items]
+                counts = {}
+                for u in items:
+                    counts[u["status"]] = counts.get(u["status"], 0) + 1
+                return [{**self.batches[0], "items": items, "links": links, "text": "\n".join(links), "status_counts": counts}]
+
+            def update_batch_urls_status(self, batch_id, status, reviewer=None):
+                updated = []
+                for u in self.urls.values():
+                    if u["batch_id"] == batch_id:
+                        u["status"] = status
+                        updated.append(dict(u))
+                return updated
+
+            def update_status(self, url_id, status=None, **fields):
+                if url_id not in self.urls:
+                    return None
+                if status is not None:
+                    self.urls[url_id]["status"] = status
+                self.urls[url_id].update(fields)
+                return dict(self.urls[url_id])
+
+        db = _BatchHistoryDB()
+        client = TestClient(create_app(db=db))
+
+        # 1. GET /api/batches returns batch history with links & status_counts
+        res = client.get("/api/batches")
+        self.assertEqual(res.status_code, 200)
+        batches = res.json()["batches"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["text"], "slot1.id\nslot2.id")
+        self.assertEqual(batches[0]["status_counts"], {"exported": 2})
+
+        # 2. Mark entire batch as submitted
+        r_sub = client.post("/api/batches/10/status", json={"status": "submitted", "reviewer": "member-1"})
+        self.assertEqual(r_sub.status_code, 200)
+        self.assertEqual(r_sub.json()["updated_count"], 2)
+        self.assertTrue(all(u["status"] == "submitted" for u in db.urls.values()))
+
+        # 3. Mark one URL in the batch as claimed_external
+        r_claim = client.post("/api/urls/102/status", json={"status": "claimed_external", "reviewer": "member-1"})
+        self.assertEqual(r_claim.status_code, 200)
+        self.assertEqual(db.urls[102]["status"], "claimed_external")
+        self.assertEqual(client.get("/api/batches").json()["batches"][0]["status_counts"], {"submitted": 1, "claimed_external": 1})
+
+    def test_ui_pipeline_endpoints_ingest_collect_verify_and_triage(self):
+        from fastapi.testclient import TestClient
+        from src.app import create_app
+        from src.verify import VerifyResult
+
+        class _PipelineDB:
+            def __init__(self):
+                self._seq = 0
+                self.rows = {}
+
+            def insert_urls(self, items, source="manual", status="new"):
+                out = []
+                seen = {r["normalized_url"] for r in self.rows.values()}
+                for item in items:
+                    raw = item if isinstance(item, str) else item["raw_url"]
+                    norm = raw.replace("https://", "").replace("http://", "").strip("/")
+                    if norm in seen or "127.0.0.1" in norm:
+                        continue
+                    seen.add(norm)
+                    self._seq += 1
+                    row = {
+                        "id": self._seq,
+                        "raw_url": raw,
+                        "normalized_url": norm,
+                        "source": source,
+                        "status": status,
+                        "ai_category": item.get("ai_category") if isinstance(item, dict) else None,
+                        "ai_note": item.get("ai_note") if isinstance(item, dict) else None,
+                    }
+                    self.rows[self._seq] = row
+                    out.append(row)
+                return out
+
+            def fetch_queue(self, status="new", limit=50):
+                return [r for r in self.rows.values() if r["status"] == status][:limit]
+
+            def update_status(self, url_id, status=None, **fields):
+                row = self.rows.get(url_id)
+                if not row:
+                    return None
+                if status is not None:
+                    row["status"] = status
+                row.update(fields)
+                return row
+
+            def upload_screenshot(self, path, data):
+                return path
+
+        class _FakeVerifier:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def verify_url(self, raw_url, url_id=None):
+                return VerifyResult(
+                    input_url=raw_url,
+                    normalized_url=raw_url.replace("https://", ""),
+                    final_url=raw_url,
+                    final_normalized_url=raw_url.replace("https://", ""),
+                    status="verified",
+                    http_status=200,
+                    page_title="Slot Gacor 88",
+                    raw_html="<html><body>Daftar slot online gacor</body></html>",
+                    screenshot_bytes=b"\xff\xd8\xffdemo",
+                    screenshot_path=f"{url_id}_slot.jpg",
+                )
+
+        async def _fake_collector(req):
+            return [SimpleNamespace(normalized_url="auto-judol88.id", source="ct_log", category_hint="judol", matched_rule="judol:slot88")]
+
+        db = _PipelineDB()
+        client = TestClient(create_app(db=db, verifier_factory=_FakeVerifier, collector_fn=_fake_collector))
+
+        # 1. Manual ingest
+        r_ing = client.post("/api/pipeline/ingest", json={"urls_text": "https://manual1.id\nhttps://manual1.id\nhttp://127.0.0.1"})
+        self.assertEqual(r_ing.status_code, 200)
+        self.assertEqual(r_ing.json()["inserted_count"], 1)
+
+        # 2. Automatic CT collector
+        r_col = client.post("/api/pipeline/collect", json={"mode": "tail", "limit": 5})
+        self.assertEqual(r_col.status_code, 200)
+        self.assertEqual(r_col.json()["inserted_count"], 1)
+
+        # 3. Verify queue -> screenshot path + verified
+        r_ver = client.post("/api/pipeline/verify", json={"limit": 5})
+        self.assertEqual(r_ver.status_code, 200)
+        self.assertEqual(r_ver.json()["verified"], 2)
+
+        # 4. Export batch prompt (30) + import DeepSeek web-chat reply
+        r_exp = client.post("/api/pipeline/triage/export-prompts", json={"limit": 30})
+        self.assertEqual(r_exp.status_code, 200)
+        self.assertEqual(r_exp.json()["site_count"], 2)
+        self.assertEqual(len(r_exp.json()["prompts"]), 1)
+
+        reply = json.dumps([
+            {"id": 1, "normalized_url": "manual1.id", "category": "judol", "confidence": 0.95, "reason_140": "Situs slot online"},
+            {"id": 2, "normalized_url": "auto-judol88.id", "category": "judol", "confidence": 0.99, "reason_140": "Domain judol baru"},
+        ])
+        r_imp = client.post("/api/pipeline/triage/import", json={"raw_text": reply})
+        self.assertEqual(r_imp.status_code, 200)
+        self.assertEqual(r_imp.json()["imported_count"], 2)
+        self.assertEqual(db.rows[1]["status"], "triaged")
+
 
 if __name__ == "__main__":
     unittest.main()
