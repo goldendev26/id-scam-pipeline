@@ -78,6 +78,15 @@ class TestSupabaseDB(unittest.TestCase):
                     ],
                 )
 
+            if request.method == "POST" and path == "/rest/v1/rpc/status_counts":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"status": "new", "total": 12},
+                        {"status": "approved", "total": 45},
+                    ],
+                )
+
             if request.method == "POST" and path.startswith("/storage/v1/object/screenshots/"):
                 self.assertEqual(request.headers.get("content-type"), "image/jpeg")
                 self.assertEqual(request.headers.get("x-upsert"), "true")
@@ -109,6 +118,9 @@ class TestSupabaseDB(unittest.TestCase):
 
         obj_path = db.upload_screenshot("1_slot99.id.jpg", b"\xff\xd8\xffdemo")
         self.assertEqual(obj_path, "1_slot99.id.jpg")
+
+        counts = db.get_status_counts()
+        self.assertEqual(counts, {"new": 12, "approved": 45})
 
 
 class TestScreenshotCompressionAndUpload(unittest.IsolatedAsyncioTestCase):
