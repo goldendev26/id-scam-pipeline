@@ -1,27 +1,34 @@
 """Configurable Playwright batch form submitter.
 
-Saat hari perlombaan, cukup ganti `SUBMIT_TARGET_URL` (dan selector form jika berbeda)
-di `.env` / `docker-compose.yml` — tidak perlu mengubah alur kode.
+Defaults to the local mock portal (`http://127.0.0.1:8001` or `http://mock-target:8001`).
+Enforces the 20-link batch cap, a >= 3-second cooldown between submissions,
+SSRF target-host validation, and never bypasses CAPTCHAs or login gates.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import json
 import os
 import re
+import time
 from typing import Any, Callable, Optional, Sequence
+from urllib.parse import urlsplit
 
 from src.db import load_dotenv
+from src.normalizer import MAX_BATCH_ITEMS
 from src.verify import CHROMIUM_ARGS
 
-# --- Konfigurasi Target Submit (ganti via .env saat hari-H) ---
 DEFAULT_SUBMIT_TARGET_URL = "http://127.0.0.1:8001"
 DEFAULT_LINKS_SELECTOR = 'textarea[name="links"]'
 DEFAULT_REPORTER_SELECTOR = 'input[name="reporter"]'
 DEFAULT_BUTTON_SELECTOR = 'button[type="submit"]'
 DEFAULT_SUCCESS_SELECTOR = '[data-submit-status="ok"]'
 DEFAULT_SUBMIT_TIMEOUT_MS = 15000
+DEFAULT_SUBMIT_COOLDOWN_S = 3.0
+
+ALLOWED_SUBMIT_HOSTS = frozenset({"127.0.0.1", "localhost", "mock-target", "imphnen.dev"})
 
 _CAPTCHA_MARKERS = (
     "challenges.cloudflare.com/turnstile",
@@ -33,6 +40,51 @@ _CAPTCHA_MARKERS = (
     "verify you are human",
 )
 
+_last_submit_ts: float = 0.0
+_cooldown_lock: Optional[asyncio.Lock] = None
+
+
+def _get_cooldown_lock() -> asyncio.Lock:
+    global _cooldown_lock
+    if _cooldown_lock is None:
+        _cooldown_lock = asyncio.Lock()
+    return _cooldown_lock
+
+
+async def _enforce_cooldown(cooldown_s: float) -> None:
+    """Wait if needed so consecutive submissions respect the >= 3s cooldown."""
+    global _last_submit_ts
+    if cooldown_s <= 0:
+        return
+    async with _get_cooldown_lock():
+        now = time.monotonic()
+        elapsed = now - _last_submit_ts
+        if _last_submit_ts > 0 and elapsed < cooldown_s:
+            await asyncio.sleep(cooldown_s - elapsed)
+        _last_submit_ts = time.monotonic()
+
+
+def validate_submit_target_url(target_url: str) -> str:
+    """Validate target URL against allowed submission hosts to prevent SSRF."""
+    cleaned = (target_url or "").strip()
+    parsed = urlsplit(cleaned)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Target portal URL tidak valid (wajib http/https).")
+
+    host = parsed.hostname.lower()
+    env_target = os.getenv("SUBMIT_TARGET_URL", "").strip()
+    env_host = urlsplit(env_target).hostname.lower() if env_target and urlsplit(env_target).hostname else ""
+
+    allowed = set(ALLOWED_SUBMIT_HOSTS)
+    if env_host:
+        allowed.add(env_host)
+
+    if host not in allowed:
+        raise ValueError(
+            f"Host target '{host}' tidak diizinkan. Atur SUBMIT_TARGET_URL di .env atau gunakan portal mock."
+        )
+    return cleaned
+
 
 @dataclass(frozen=True)
 class SubmitConfig:
@@ -42,18 +94,21 @@ class SubmitConfig:
     button_selector: str = DEFAULT_BUTTON_SELECTOR
     success_selector: str = DEFAULT_SUCCESS_SELECTOR
     timeout_ms: int = DEFAULT_SUBMIT_TIMEOUT_MS
+    cooldown_s: float = DEFAULT_SUBMIT_COOLDOWN_S
 
     @classmethod
     def from_env(cls, target_url_override: Optional[str] = None) -> "SubmitConfig":
         load_dotenv()
-        target = (target_url_override or os.getenv("SUBMIT_TARGET_URL", "")).strip() or DEFAULT_SUBMIT_TARGET_URL
+        raw_target = (target_url_override or os.getenv("SUBMIT_TARGET_URL", "")).strip() or DEFAULT_SUBMIT_TARGET_URL
+        validated_target = validate_submit_target_url(raw_target)
         return cls(
-            target_url=target,
+            target_url=validated_target,
             links_selector=os.getenv("SUBMIT_LINKS_SELECTOR", DEFAULT_LINKS_SELECTOR).strip() or DEFAULT_LINKS_SELECTOR,
             reporter_selector=os.getenv("SUBMIT_REPORTER_SELECTOR", DEFAULT_REPORTER_SELECTOR).strip(),
             button_selector=os.getenv("SUBMIT_BUTTON_SELECTOR", DEFAULT_BUTTON_SELECTOR).strip() or DEFAULT_BUTTON_SELECTOR,
             success_selector=os.getenv("SUBMIT_SUCCESS_SELECTOR", DEFAULT_SUCCESS_SELECTOR).strip(),
             timeout_ms=int(os.getenv("SUBMIT_TIMEOUT_MS", str(DEFAULT_SUBMIT_TIMEOUT_MS))),
+            cooldown_s=float(os.getenv("SUBMIT_COOLDOWN_S", str(DEFAULT_SUBMIT_COOLDOWN_S))),
         )
 
 
@@ -85,9 +140,9 @@ def detect_gate_or_captcha(html_text: str, current_url: str = "") -> Optional[st
     lowered_url = (current_url or "").lower()
     for marker in _CAPTCHA_MARKERS:
         if marker in lowered_html:
-            return f"Terdeteksi CAPTCHA/anti-bot ({marker}) — lanjutkan submit manual."
-    if any(seg in lowered_url for seg in ("/login", "/signin", "/auth/")) and "<input" in lowered_html and 'type="password"' in lowered_html:
-        return "Halaman membutuhkan login — silakan login & submit manual."
+            return f"Terdeteksi CAPTCHA/anti-bot ({marker}); lanjutkan submit manual."
+    if any(seg in lowered_url for seg in ("/login", "/signin", "/masuk", "/auth/")) and "<input" in lowered_html and 'type="password"' in lowered_html:
+        return "Halaman membutuhkan login; silakan login & submit manual."
     return None
 
 
@@ -125,11 +180,15 @@ async def submit_batch_playwright(
     target_url: Optional[str] = None,
     playwright_factory: Optional[Callable[[], Any]] = None,
 ) -> SubmitResult:
-    """Fill and submit a batch of normalized links to the configured submission portal."""
-    clean_links = [str(u).strip() for u in links if str(u).strip()]
+    """Fill and submit up to 20 normalized links to the configured submission portal."""
+    clean_links = [str(u).strip() for u in links if str(u).strip()][:MAX_BATCH_ITEMS]
     cfg = config or SubmitConfig.from_env(target_url_override=target_url)
+    validate_submit_target_url(cfg.target_url)
+
     if not clean_links:
         return SubmitResult(ok=False, status="failed", target_url=cfg.target_url, detail="Tidak ada link untuk dikirim.")
+
+    await _enforce_cooldown(cfg.cooldown_s)
 
     if playwright_factory is None:
         from playwright.async_api import async_playwright

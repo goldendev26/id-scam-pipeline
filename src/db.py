@@ -310,7 +310,7 @@ class SupabaseDB:
             f"{self.base_url}/rest/v1/urls",
             params={
                 "batch_id": f"in.({batch_ids})",
-                "select": "id,batch_id,normalized_url,status,ai_category,ai_note",
+                "select": "id,batch_id,normalized_url,final_normalized_url,status,ai_category,ai_note",
                 "order": "id.asc",
             },
             headers=self._headers(),
@@ -329,7 +329,7 @@ class SupabaseDB:
             for item in items:
                 st = str(item.get("status") or "unknown")
                 status_counts[st] = status_counts.get(st, 0) + 1
-            links = [item["normalized_url"] for item in items]
+            links = [item.get("final_normalized_url") or item["normalized_url"] for item in items]
             result.append(
                 {
                     **b,
@@ -340,6 +340,43 @@ class SupabaseDB:
                 }
             )
         return result
+
+    def fetch_batch_by_id(self, batch_id: int) -> Optional[dict[str, Any]]:
+        """Ambil 1 batch berdasarkan ID langsung dari DB (tanpa batas 50 batch terakhir)."""
+        resp = self._client.get(
+            f"{self.base_url}/rest/v1/batches",
+            params={"id": f"eq.{batch_id}", "limit": "1"},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        rows = resp.json() if resp.content else []
+        if not rows:
+            return None
+        batch = rows[0]
+
+        urls_resp = self._client.get(
+            f"{self.base_url}/rest/v1/urls",
+            params={
+                "batch_id": f"eq.{batch_id}",
+                "select": "id,batch_id,normalized_url,final_normalized_url,status,ai_category,ai_note",
+                "order": "id.asc",
+            },
+            headers=self._headers(),
+        )
+        urls_resp.raise_for_status()
+        items: list[dict[str, Any]] = urls_resp.json() if urls_resp.content else []
+        status_counts: dict[str, int] = {}
+        for item in items:
+            st = str(item.get("status") or "unknown")
+            status_counts[st] = status_counts.get(st, 0) + 1
+        links = [item.get("final_normalized_url") or item["normalized_url"] for item in items]
+        return {
+            **batch,
+            "links": links,
+            "text": "\n".join(links),
+            "items": items,
+            "status_counts": status_counts,
+        }
 
     def update_batch_urls_status(
         self,

@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from src.cert_collector import DEFAULT_MULTI_CT_LOGS, tail_multi_ct_logs
 from src.db import SupabaseDB, load_dotenv
+from src.discover import fetch_all_feeds
 from src.verify import SafeBrowserVerifier, extract_clean_text
 
 DEFAULT_DISCOVER_INTERVAL_S = 30.0
@@ -32,9 +33,11 @@ async def run_discover_pass(
     backfill: int = 2000,
     duration_s: float = 20.0,
     limit: int = 30,
+    include_feeds: bool = False,
     collector_fn: Optional[Callable[..., Any]] = None,
+    feeds_fn: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
-    """Collect fresh CT domains and insert them into Supabase with status='new'."""
+    """Collect fresh CT domains (and periodic OpenPhish/PhishingDB feeds) into Supabase."""
     collect = collector_fn or tail_multi_ct_logs
     candidates = await collect(
         log_urls=log_urls,
@@ -52,10 +55,28 @@ async def run_discover_pass(
         }
         for c in candidates
     ]
+
+    feed_found = 0
+    if include_feeds:
+        fetch_feeds = feeds_fn or fetch_all_feeds
+        feed_items = await fetch_feeds(limit_per_feed=limit, indonesia_only=True, verbose=False)
+        feed_found = len(feed_items)
+        for item in feed_items:
+            rows.append(
+                {
+                    "raw_url": item.raw_url if item.raw_url.startswith(("http://", "https://")) else f"https://{item.normalized_url}",
+                    "source": item.source,
+                    "ai_category": item.category_hint,
+                    "ai_note": f"Feed match: {item.matched_rule}"[:140] if item.matched_rule else None,
+                }
+            )
+
     inserted = await asyncio.to_thread(db.insert_urls, rows, "ct_log", "new") if rows else []
     return {
         "stage": "discover",
-        "found": len(candidates),
+        "found": len(candidates) + feed_found,
+        "ct_found": len(candidates),
+        "feed_found": feed_found,
         "inserted": len(inserted),
     }
 
@@ -185,6 +206,7 @@ async def _loop(
                         db,
                         backfill=backfill if cycle == 1 else min(backfill, 1500),
                         duration_s=collect_duration,
+                        include_feeds=(cycle == 1 or cycle % 10 == 0),
                     )
                     print(json.dumps({"cycle": cycle, **summary}), flush=True)
                 except Exception as exc:
